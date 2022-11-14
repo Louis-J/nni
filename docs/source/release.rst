@@ -26,9 +26,9 @@ Compression
 Hyper-parameter optimization
 """"""""""""""""""""""""""""
 
+*  Supported rerunning the interrupted trials induced by the termination of an NNI experiment when resuming this experiment.
 *  Fixed a dependency issue of Anneal tuner by changing Anneal tuner dependency to optional.
 *  Fixed a bug that tuner might lose connection in long experiments.
-*  Supported rerunning the interrupted trials induced by the termination of an NNI experiment when resuming this experiment.
 
 Training service
 """"""""""""""""

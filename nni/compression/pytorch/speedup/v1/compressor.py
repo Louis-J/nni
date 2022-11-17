@@ -14,10 +14,10 @@ import torch.nn as nn
 from nni.common.graph_utils import build_module_graph
 from nni.compression.pytorch.utils.mask_conflict import fix_mask_conflict
 from nni.compression.pytorch.utils.utils import get_module_by_name
-from .compress_modules import replace_module
+from ..compress_modules import replace_module
 from .infer_mask import AutoMaskInference, seeds
-from .jit_translate import jit_to_python_function
-from ..utils import rand_like_with_shape
+from ..jit_translate import jit_to_python_function
+from ...utils import rand_like_with_shape
 
 _logger = logging.getLogger(__name__)
 _logger.setLevel(logging.INFO)
@@ -410,57 +410,6 @@ class ModelSpeedup:
         of the mask. We keep repeating these two steps until the masks of the model doesn't
         change.
         """
-        self.input_debugnames = {}
-        self.intermediate_masks = {}
-
-        # unpack the tensor tuple/list before the mask inference
-        self.torch_graph.unpack_manually()
-        # find the input/ouput tensor of the whole graph
-        for name, nodeio in self.torch_graph.nodes_py.nodes_io.items():
-            if nodeio.input_or_output == 'input':
-                # also put the graph input tensor into the internal_result
-                # TODO if we can find the corresponding relation between the value node
-                # and the dummy_inputs, we can use the inputs value in the dummy_input
-                value = self._vnode_to_value(self.debugname_to_value[name])
-                self.internal_result[name] = value
-                # create the mask tensor for the input value
-                if isinstance(self.internal_result[name], torch.Tensor):
-                    torch.manual_seed(100)
-                    self.internal_result[name] = torch.rand_like(value)
-                    self.intermediate_masks[name] = torch.ones_like(value)
-                    # self.constant[nasme] = torch.zeros_like(value)
-        # count the degree for the node in the graph
-        torch.manual_seed(100)
-        seeds['inter_var'] = 1000
-        seeds['weight'] = 1000
-        for node in self.direct_order():
-            self.propagate_orig(node)
-        print('inter var1:')
-        print([(k, torch.sum(v.orig_output)) for k, v in self.auto_inferences.items()])
-        print('inter var1.5:')
-        print([(k, v.orig_output.grad is None) for k, v in self.auto_inferences.items()])
-        torch.manual_seed(100)
-        seeds['inter_var'] = 1000
-        seeds['weight'] = 1000
-        for node in self.direct_order():
-            self.update_direct_sparsity(node)
-        print('inter var2:')
-        print([(k, [(torch.manual_seed(100), torch.sum(torch.rand_like(i.to(torch.float)) * i))[1] for i in v.in_masks]) for k, v in self.auto_inferences.items()])
-        print('inter var3:')
-        print([(k, (torch.manual_seed(100), torch.sum(torch.rand_like(v.out_masks.to(torch.float)) * v.out_masks))[1]) for k, v in self.auto_inferences.items()])
-        print('inter var4:')
-        print([(ko, [(ki, (torch.manual_seed(100), torch.sum(torch.rand_like(vi.to(torch.float)) * vi))[1]) for ki, vi in vo.items()]) for ko, vo in self.masks.items() if not ko.startswith('.')])
-        print('inter var4.5:')
-        print([(k, v.orig_output.grad is None) for k, v in self.auto_inferences.items()])
-        torch.manual_seed(100)
-        seeds['inter_var'] = 1000
-        seeds['weight'] = 1000
-        for node in self.indirect_order():
-            self.update_indirect_sparsity(node)
-        print('inter var5:')
-        print([(k, (torch.manual_seed(100), torch.sum(torch.rand_like(v.out_masks.to(torch.float)) * v.out_masks))[1]) for k, v in self.auto_inferences.items()])
-        # print('inter var6:')
-        # print([(k, (torch.manual_seed(100), torch.sum(torch.rand_like(v.out_masks.to(torch.float)) * v.out_masks))[1]) for k, v in self.auto_inferences.items()])
 
     def replace_compressed_modules(self):
         """
@@ -593,9 +542,32 @@ class ModelSpeedup:
 
         for graph_input in traced_graph.inputs():
             if graph_input.type().kind() == 'ClassType':
-                self.internal_result[graph_input.debugName()
-                                     ] = self.bound_model
+                self.internal_result[graph_input.debugName()] = self.bound_model
                 break
+
+        self.training = self.bound_model.training
+        # set to the evaluation mode
+        self.bound_model.train(False)
+
+    def initialize_propagate(self):
+        self.input_debugnames = {}
+        self.intermediate_masks = {}
+
+        # unpack the tensor tuple/list before the mask inference
+        self.torch_graph.unpack_manually()
+        # find the input/ouput tensor of the whole graph
+        for name, nodeio in self.torch_graph.nodes_py.nodes_io.items():
+            if nodeio.input_or_output == 'input':
+                # also put the graph input tensor into the internal_result
+                # TODO if we can find the corresponding relation between the value node
+                # and the dummy_inputs, we can use the inputs value in the dummy_input
+                value = self._vnode_to_value(self.debugname_to_value[name])
+                self.internal_result[name] = value
+                # create the mask tensor for the input value
+                if isinstance(self.internal_result[name], torch.Tensor):
+                    torch.manual_seed(100)
+                    self.internal_result[name] = torch.rand_like(value)
+                    self.intermediate_masks[name] = torch.ones_like(value)
 
     def speedup_model(self):
         """
@@ -605,15 +577,49 @@ class ModelSpeedup:
 
         _logger.info("start to speedup the model")
         self.initialize_speedup()
-        training = self.bound_model.training
-        # set to the evaluation mode
-        self.bound_model.train(False)
         # TODO suppose to fix the conflict after the sparsity propagation
         # which is more elegent
         fix_mask_conflict(self.masks, self.bound_model, self.dummy_input)
 
         _logger.info("infer module masks...")
-        self.infer_modules_masks()
+        self.initialize_propagate()
+
+        _logger.info("propagate original variables")
+        torch.manual_seed(100)
+        seeds['inter_var'] = 1000
+        seeds['weight'] = 1000
+        for node in self.direct_order():
+            self.propagate_orig(node)
+        print('inter var1:')
+        print([(k, torch.sum(v.orig_output)) for k, v in self.auto_inferences.items()])
+        print('inter var1.5:')
+        print([(k, v.orig_output.grad is None) for k, v in self.auto_inferences.items()])
+
+        _logger.info("update direct sparsity")
+        torch.manual_seed(100)
+        seeds['inter_var'] = 1000
+        seeds['weight'] = 1000
+        for node in self.direct_order():
+            self.update_direct_sparsity(node)
+        print('inter var2:')
+        print([(k, [(torch.manual_seed(100), torch.sum(torch.rand_like(i.to(torch.float)) * i))[1] for i in v.in_masks]) for k, v in self.auto_inferences.items()])
+        print('inter var3:')
+        print([(k, (torch.manual_seed(100), torch.sum(torch.rand_like(v.out_masks.to(torch.float)) * v.out_masks))[1]) for k, v in self.auto_inferences.items()])
+        print('inter var4:')
+        print([(ko, [(ki, (torch.manual_seed(100), torch.sum(torch.rand_like(vi.to(torch.float)) * vi))[1]) for ki, vi in vo.items()]) for ko, vo in self.masks.items() if not ko.startswith('.')])
+        print('inter var4.5:')
+        print([(k, v.orig_output.grad is None) for k, v in self.auto_inferences.items()])
+
+        _logger.info("update indirect sparsity")
+        torch.manual_seed(100)
+        seeds['inter_var'] = 1000
+        seeds['weight'] = 1000
+        for node in self.indirect_order():
+            self.update_indirect_sparsity(node)
+        print('inter var5:')
+        print([(k, (torch.manual_seed(100), torch.sum(torch.rand_like(v.out_masks.to(torch.float)) * v.out_masks))[1]) for k, v in self.auto_inferences.items()])
+        # print('inter var6:')
+        # print([(k, (torch.manual_seed(100), torch.sum(torch.rand_like(v.out_masks.to(torch.float)) * v.out_masks))[1]) for k, v in self.auto_inferences.items()])
         _logger.info('resolve the mask conflict')
 
         # load the original stat dict before replace the model
@@ -621,5 +627,5 @@ class ModelSpeedup:
         _logger.info("replace compressed modules...")
         # the mask conflict should be already resolved
         self.replace_compressed_modules()
-        self.bound_model.train(training)
+        self.bound_model.train(self.training)
         _logger.info("speedup done")

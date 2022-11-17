@@ -3,12 +3,11 @@
 
 from types import MappingProxyType
 import logging
-from typing import Dict
 import torch
 import torch.nn as nn
-from ..utils import randomize_tensor, torch_float_dtype, torch_integer_dtype
+from ...utils import randomize_tensor, torch_float_dtype, torch_integer_dtype
 
-from nni.common.concrete_trace_utils.utils import run_onlyif_instance, map_aggregate_zip, map_aggregate
+from .utils import run_onlyif_instance, map_recursive, map_recursive_zip
 
 _logger = logging.getLogger(__name__)
 _logger.setLevel(logging.INFO)
@@ -330,7 +329,7 @@ class AutoMaskInference:
             assert not isinstance(out_mask, torch.Tensor)
 
     def update_indirect_weight_mask(self, output):
-        map_aggregate_zip(self.update_indirect_weight_mask_helper, output, self.out_masks)
+        map_recursive_zip(self.update_indirect_weight_mask_helper, output, self.out_masks)
 
         # update the sparsity of the paramters
         if isinstance(self.module, nn.Module):
@@ -350,7 +349,7 @@ class AutoMaskInference:
         by other sparsity(we call it indirect sparsity here). Basically we can find
         these potential sparsity through gradient.
         """
-        
+
         self.update_indirect_out_mask()
 
         # Forward inference with auto gradient enabled

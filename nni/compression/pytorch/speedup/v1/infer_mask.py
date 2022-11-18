@@ -364,7 +364,6 @@ class AutoMaskInference:
 
     def update_direct_sparsity(self):
         # we don't need the gradient in the forward inference
-        out_mask = None
         with torch.no_grad():
             the_dummy_input = self.init_and_apply()
             out = self.module(*the_dummy_input)

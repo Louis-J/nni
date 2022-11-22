@@ -131,9 +131,9 @@ class TorchModel1(torch.nn.Module):
 
         x = x / 1.00001
 
-        x = torch.permute(x, (0, 2, 3, 1))
-        x = torch.permute(x, (0, 2, 3, 1))
-        x = torch.permute(x, (0, 2, 3, 1))
+        # x = torch.permute(x, (0, 2, 3, 1))
+        # x = torch.permute(x, (0, 2, 3, 1))
+        # x = torch.permute(x, (0, 2, 3, 1))
         x = torch.unsqueeze(x, dim=1)
         x = torch.select(x, dim=1, index=0)
         x = torch.unsqueeze(x, dim=1)
@@ -143,17 +143,17 @@ class TorchModel1(torch.nn.Module):
         x = torch.unsqueeze(x, dim=1)
         x = torch.squeeze(x, dim=1)
         x = torch.flatten(x, 1)
-        x = x.reshape(x.shape)
-        x = x.view(-1, x.size(1))
+        # x = x.reshape(x.shape)
+        # x = x.view(-1, x.size(1))
 
 
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = F.softmax(self.fc3(x), dim=1)
 
-        y1 = x[:,0:int(x.size(1)/2)]
-        y2 = x[:,int(x.size(1)/2):x.size(1)]
-        x = torch.cat((y1, y2), dim=1)
+        # y1 = x[:,0:int(x.size(1)/2)]
+        # y2 = x[:,int(x.size(1)/2):x.size(1)]
+        # x = torch.cat((y1, y2), dim=1)
 
         x = x.type_as(x)
         # dim = x.dim()

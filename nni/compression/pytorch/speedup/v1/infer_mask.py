@@ -17,6 +17,9 @@ STD_DELTA = 1e-6
 seeds = {
     'inter_var': None,
     'weight': None,
+
+    'r_inter_var': None,
+    'r_weight': None,
 }
 
 class AutoMaskInference:
@@ -70,22 +73,19 @@ class AutoMaskInference:
         # Initialize the mask for output tensors
         self.orig_output = speedup.internal_result[out_debugname]
 
-        if isinstance(module, nn.GroupNorm):
-            self.out_masks = self.in_masks[0]
+        if isinstance(self.orig_output, torch.Tensor):
+            self.out_masks = torch.ones_like(self.orig_output)
+        elif isinstance(self.orig_output, list) or isinstance(self.orig_output, tuple):
+            self.out_masks = []
+            for o_tensor in self.orig_output:
+                if isinstance(o_tensor, torch.Tensor):
+                    self.out_masks.append(torch.ones_like(o_tensor))
+                else:
+                    # if one of the outputs is not tensor, set the corresponding
+                    # mask to None
+                    self.out_masks.append(None)
         else:
-            if isinstance(self.orig_output, torch.Tensor):
-                self.out_masks = torch.ones_like(self.orig_output)
-            elif isinstance(self.orig_output, list) or isinstance(self.orig_output, tuple):
-                self.out_masks = []
-                for o_tensor in self.orig_output:
-                    if isinstance(o_tensor, torch.Tensor):
-                        self.out_masks.append(torch.ones_like(o_tensor))
-                    else:
-                        # if one of the outputs is not tensor, set the corresponding
-                        # mask to None
-                        self.out_masks.append(None)
-            else:
-                self.out_masks = None
+            self.out_masks = None
 
         # Initialize the mask for the parameters
         self.weight_mask = {}
@@ -98,10 +98,8 @@ class AutoMaskInference:
             for name, para in module.named_parameters():
                 if name not in self.weight_mask:
                     self.weight_mask[name] = torch.ones_like(para.data)
-        
-            self.saved_weights = MappingProxyType({
-                k: v.clone() for k, v in module.named_parameters()
-            })
+
+            self.saved_weights = set(k for k, _v in module.named_parameters())
 
         self.state_dict = state_dict
         # TODO support the other batch dimension in the future
@@ -138,7 +136,7 @@ class AutoMaskInference:
         # rules for ReLU6 to break this range constraint.
         with torch.no_grad():
             for tensor in input:
-                if isinstance(tensor, torch.Tensor) and len(tensor.size()) > self.batch_dim\
+                if isinstance(tensor, torch.Tensor) and tensor.numel() != 1 and len(tensor.size()) > self.batch_dim\
                     and tensor.size(self.batch_dim) == self.batch_size:
                     # if the input tensor only has one dimension, which means
                     # it doesn't have the batch dimension, then we don't randomize
@@ -154,7 +152,7 @@ class AutoMaskInference:
 
     def randomize_weight(self, start, end):
         with torch.no_grad():
-            for weight_key in self.saved_weights.keys():
+            for weight_key in self.saved_weights:
                 seeds['weight'] += 1
                 torch.manual_seed(seeds['weight'])
                 randomize_tensor(self.module.get_parameter(weight_key).data, start, end)
@@ -196,7 +194,7 @@ class AutoMaskInference:
         with torch.no_grad():
             # apply the input mask
             for tid, in_tensor in enumerate(input):
-                if isinstance(in_tensor, torch.Tensor) and self.in_masks[tid] is not None:
+                if isinstance(in_tensor, torch.Tensor) and in_tensor.numel() != 1 and self.in_masks[tid] is not None:
                     # issue-4540 when two tensors are multiplied, the constants part make
                     # the propagation weaker, and lead to shape misaligment. Currently, we
                     # donnot support the constant folding, so, we just remove the constant here
@@ -211,7 +209,7 @@ class AutoMaskInference:
         """
         with torch.no_grad():
             # apply the weight mask
-            for weight_key in self.saved_weights.keys():
+            for weight_key in self.saved_weights:
                 if weight_key in self.weight_mask:
                     self.module.register_parameter(
                         weight_key,
@@ -221,11 +219,11 @@ class AutoMaskInference:
     def calc_out_masks(self, out):
         if isinstance(out, torch.Tensor):
             out_mask = self.calc_one_masked_mask(out.clone().detach())
-        elif isinstance(out, tuple) or isinstance(out, list):
+        elif isinstance(out, tuple) or isinstance(out, list) and isinstance(out[0], torch.Tensor):
             out_mask = [self.calc_one_masked_mask(tout.clone().detach()) for tout in out]
         else:
-            _logger.warning(
-                'Only support the OP whose output is tensor/tuple of tensor/list of tensor')
+            # _logger.warning(
+            #     'Only support the OP whose output is tensor/tuple of tensor/list of tensor')
             out_mask = None
 
         # We also need random the parameters of the module, because if the weight of the model has
@@ -307,17 +305,17 @@ class AutoMaskInference:
             for batchid in range(self.orig_output.size(0)):
                 # set the same mask value for the whole batche
                 self.out_masks[batchid][_grad_zero] = 0
-        elif isinstance(self.orig_output, tuple) or isinstance(self.orig_output, list):
+        elif isinstance(self.orig_output, (tuple, list)):
             assert isinstance(self.out_masks, (tuple, list))
             for oid, tout in enumerate(self.orig_output):
-                errmsg = 'The output only support tensor/list of tensors'
-                assert isinstance(tout, torch.Tensor), errmsg
-                gradient_sum = torch.sum(
-                    torch.abs(self.orig_output.grad.data), dim=0)
-                _grad_zero = gradient_sum == 0
-                for batchid in range(self.orig_output.size(0)):
-                    # set the same mask value for the whole batch
-                    self.out_masks[oid][batchid][_grad_zero] = 0
+                # errmsg = 'The output only support tensor/list of tensors'
+                # assert isinstance(tout, torch.Tensor), errmsg
+                if isinstance(tout, torch.Tensor) and tout.grad is not None:
+                    gradient_sum = torch.sum(torch.abs(tout.grad.data), dim=0)
+                    _grad_zero = gradient_sum == 0
+                    for batchid in range(tout.size(0)):
+                        # set the same mask value for the whole batch
+                        self.out_masks[oid][batchid][_grad_zero] = 0
 
     def update_indirect_weight_mask_helper(self, output, out_mask):
         # Note: output maybe tensor or list/tuple of tensors
@@ -333,7 +331,7 @@ class AutoMaskInference:
 
         # update the sparsity of the paramters
         if isinstance(self.module, nn.Module):
-            for weight_key in self.saved_weights.keys():
+            for weight_key in self.saved_weights:
                 grad_zero = self.module.get_parameter(weight_key).grad.data == 0
                 self.weight_mask[weight_key][grad_zero] = 0
 

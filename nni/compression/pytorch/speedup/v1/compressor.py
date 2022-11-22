@@ -17,11 +17,14 @@ from nni.compression.pytorch.utils.utils import get_module_by_name, rand_like_wi
 from nni.compression.pytorch.speedup.compress_modules import replace_module
 # from ..compress_modules import replace_module
 from nni.compression.pytorch.speedup.v1.infer_mask import AutoMaskInference, seeds
+from nni.compression.pytorch.speedup.v1.container import Slot, NodeInfo
+from nni.compression.pytorch.speedup.v1.jit_translate import r_jit_to_python_function
 # from .infer_mask import AutoMaskInference, seeds
 from nni.compression.pytorch.speedup.jit_translate import jit_to_python_function
 # from ..jit_translate import jit_to_python_function
 # from ...utils import rand_like_with_shape
 from nni.compression.pytorch.speedup.v1.utils import run_onlyif_instance, map_recursive, map_recursive_zip
+from ...utils import randomize_tensor, torch_float_dtype, torch_integer_dtype
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # Only imports the below statements during type checking
@@ -132,6 +135,122 @@ class ModelSpeedup:
             yield node
         assert len(out_degree) == 0
 
+    def debug_hash_value_one(self, obj):
+        if self.tensor_propagate_check(obj):
+            torch.manual_seed(100)
+            return torch.sum(torch.rand_like(obj.to(torch.float)) * obj)[0]
+        else:
+            return obj
+
+    def debug_hash_value(self, obj):
+        return map_recursive(self.debug_hash_value_one, obj)
+
+    def tensor_propagate_check(self, obj):
+        return isinstance(obj, torch.Tensor) and obj.dim() > self.batch_dim and obj.size(self.batch_dim) == self.confidence
+
+    def tensor_detacher(self, obj: torch.Tensor):
+        if self.tensor_propagate_check(obj):
+            return obj.detach()
+        return obj
+
+    def tensor_cloner(self, obj: torch.Tensor):
+        if self.tensor_propagate_check(obj):
+            return obj.clone()
+        return obj
+
+    def slot_getter_value_orig(self, input_name: str):
+        assert isinstance(input_name, str)
+        assert input_name in self.slots, 'slot error: lack of slot(%s)' % input_name
+        assert self.slots[input_name].status['value_0'] == 1, 'slot error: bad value_0(%d)' % self.slots[input_name].status['value_0']
+
+        return self.slots[input_name].value_orig
+
+    def slot_getter_value_orig_inplace(self, input_name: str):
+        assert isinstance(input_name, str)
+        assert input_name in self.slots, 'slot error: lack of slot(%s)' % input_name
+        assert self.slots[input_name].status['value_0'] == 1, 'slot error: bad value_0(%d)' % self.slots[input_name].status['value_0']
+
+        return self.slots[input_name].value_orig_inplace
+
+    def clone_randomizer(self, obj):
+        import copy
+        if self.tensor_propagate_check(obj):
+            new_obj = obj.clone()
+            if not new_obj.is_contiguous():
+                new_obj = new_obj.contiguous()
+            seeds['r_inter_var'] += 1
+            torch.manual_seed(seeds['r_inter_var'])
+            randomize_tensor(new_obj, start=0.1, end=8.0)
+            torch.manual_seed(100)
+            return new_obj
+        else:
+            try:
+                return copy.deepcopy(obj)
+            except copy.Error:
+                return obj
+
+    def slot_getter_mask_1(self, input_name: str):
+        assert isinstance(input_name, str)
+        assert input_name in self.slots, 'slot error: lack of slot(%s)' % input_name
+        assert self.slots[input_name].status['mask_1'] == 1, 'slot error: bad mask_1(%d)' % self.slots[input_name].status['mask_1']
+
+        return self.slots[input_name].mask_1
+
+    def slot_getter_mask_2(self, input_name: str):
+        assert isinstance(input_name, str)
+        assert input_name in self.slots, 'slot error: lack of slot(%s)' % input_name
+        assert self.slots[input_name].status['mask_2'] == 1, 'slot error: bad mask_2(%d)' % self.slots[input_name].status['mask_2']
+
+        return self.slots[input_name].mask_2
+
+    def slot_getter_mask_3(self, input_name: str):
+        assert isinstance(input_name, str)
+        assert input_name in self.slots, 'slot error: lack of slot(%s)' % input_name
+        assert self.slots[input_name].status['mask_3'] == 1, 'slot error: bad mask_3(%d)' % self.slots[input_name].status['mask_3']
+
+        return self.slots[input_name].mask_3
+
+    def mask_applier(self, value, mask):
+        if self.tensor_propagate_check(value):
+            assert isinstance(mask, torch.Tensor) and value.shape == mask.shape
+            return value * mask
+        else:
+            assert mask is None
+            return value
+
+    def calc_one_mask(self, obj):
+        if self.tensor_propagate_check(obj):
+            obj: torch.Tensor
+            STD_DELTA = 1e-6
+
+            out_mask = torch.ones_like(obj)
+            if obj.dtype in torch_integer_dtype:
+                same = obj[:] == obj[0]
+                reduced = torch.sum(same, dim=0)
+                is_constant = reduced == obj.size(0)
+                out_mask[:, is_constant] = 0
+            else:
+                std = torch.std(obj, dim=0)
+                mask_pos = std < STD_DELTA
+                out_mask[:, mask_pos] = 0
+            return out_mask
+        else:
+            return None
+
+    def merge_one_mask(self, old_mask, new_mask):
+        if self.tensor_propagate_check(old_mask):
+            assert isinstance(new_mask, torch.Tensor) and old_mask.shape == new_mask.shape
+            return old_mask * new_mask
+        else:
+            assert new_mask is None
+            return None
+
+    def tensor_requires_grad(self, obj):
+        if self.tensor_propagate_check(obj) and obj.dtype in torch_float_dtype:
+            # only float type can require the gradient
+            # enable the auto gradient
+            obj.requires_grad_(True)
+
     def _random_model_input(self, dummy_input, confidence, batch_dim):
         """
         Get the new random dummy input accordint to the original dummy_input
@@ -236,8 +355,25 @@ class ModelSpeedup:
                 continue
             # The detach operation here is for the in-place operation. We cannot
             # directly can the backward on the output tensor of an in-place operator.
-            dummy_input.append(self.internal_result[_input].detach())
-            debugnames.append(_input)
+            # dummy_input.append(self.internal_result[_input].detach())
+            if isinstance(self.internal_result[_input], torch.Tensor):
+                dummy_input.append(self.internal_result[_input].clone().detach())
+                debugnames.append(_input)
+            elif isinstance(self.internal_result[_input], (list, tuple)):
+                type_set = tuple(set(type(i) for i in self.internal_result[_input]))
+                def can_as_int(obj):
+                    if isinstance(obj, int):
+                        return True
+                    elif isinstance(obj, torch.Tensor) and obj.numel() == 1 and obj.dtype == torch.int32:
+                        return True
+                    else:
+                        return False
+                type_as_int = tuple(set(can_as_int(i) for i in self.internal_result[_input]))
+                assert len(type_set) == 1 or (len(type_as_int) == 1 and type_as_int[0] == True)
+                if len(type_set) == 1 and type_set[0] == torch.Tensor:
+                    for i in self.internal_result[_input]:
+                        dummy_input.append(i.clone().detach())
+                debugnames.append(_input)
 
         return dummy_input, debugnames
 
@@ -289,17 +425,55 @@ class ModelSpeedup:
                 state_dict=copy.deepcopy(module.state_dict()))
         auto_infer.name = unique_name
         self.auto_inferences[unique_name] = auto_infer
-        
+
+    def r_propagate_orig(self, node):
+        self.node_infos: dict[NodePyIO, NodeInfo]
+        self.slots: dict[str, Slot]
+
+        module_name = node.name
+        unique_name = node.unique_name
+        node_info = self.node_infos[node]
+
+        _logger.info('r_Propagate variables for %s', unique_name)
+
+        input_names = node_info.slots_in
+        input_values = map_recursive(self.slot_getter_value_orig_inplace, input_names)
+        input_value_detachs = map_recursive(self.tensor_detacher, input_values)
+
+        output_values = node_info.flatten_caller(*input_value_detachs)
+
+        output_names = node_info.slots_out
+        if len(output_names) == 1:
+            output_name = output_names[0]
+            self.slots[output_name].value_orig = output_values
+            self.slots[output_name].value_orig_inplace = map_recursive(self.tensor_cloner, output_values)
+            self.slots[output_name].status['value_0'] += 1
+        else:
+            assert len(output_names) == len(output_values)
+            for output_name, output_value in zip(output_names, output_values):
+                self.slots[output_name].value_orig = output_value
+                self.slots[output_name].value_orig_inplace = map_recursive(self.tensor_cloner, output_value)
+                self.slots[output_name].status['value_0'] += 1
+
     def update_direct_sparsity(self, node):
         module_name = node.name
         unique_name = node.unique_name
+
         out_debugname = node.outputs[0]
         _logger.info('Update mask for %s', unique_name)
         auto_infer = self.auto_inferences[unique_name]
 
         input_debugname = self.input_debugnames[unique_name]
         # in_masks = [self.masks[debugname] for debugname in input_debugname]
-        in_masks = [self.intermediate_masks[debugname] for debugname in input_debugname]
+        # in_masks = [self.intermediate_masks[debugname] for debugname in input_debugname]
+        in_masks = []
+        for debugname in input_debugname:
+            if isinstance(self.intermediate_masks[debugname], (list, tuple)):
+                for i in self.intermediate_masks[debugname]:
+                    if isinstance(i, torch.Tensor) and i.numel() != 1:
+                        in_masks.append(i)
+            else:
+                in_masks.append(self.intermediate_masks[debugname])
         auto_infer.update_input_info(in_masks)
         auto_infer.update_direct_sparsity()
         # update the mask tensor and the internal output of the submodules
@@ -313,6 +487,61 @@ class ModelSpeedup:
         # update the parameter mask of the node
 
         self.masks[module_name] = auto_infer.weight_mask
+
+    def r_update_direct_sparsity(self, node):
+        self.node_infos: dict[NodePyIO, NodeInfo]
+        self.slots: dict[str, Slot]
+
+        module_name = node.name
+        unique_name = node.unique_name
+        node_info = self.node_infos[node]
+
+        _logger.info('r_Update mask for %s', unique_name)
+
+        with torch.no_grad():
+            input_names = node_info.slots_in
+            # randomized, so it's same to use slot_getter_value_orig or slot_getter_value_orig_inplace
+            input_values = map_recursive(self.slot_getter_value_orig_inplace, input_names)
+            input_values_randomized = map_recursive(self.clone_randomizer, input_values)
+
+            input_masks = map_recursive(self.slot_getter_mask_1, input_names)
+            input_values_masked = map_recursive_zip(self.mask_applier, input_values_randomized, input_masks)
+
+            node_info.in_mask_clone_0 = map_recursive(self.tensor_cloner, input_masks)
+
+            if isinstance(node_info.flatten_caller, nn.Module):
+                sub_module = node_info.flatten_caller
+                for _k, v in sub_module.named_parameters():
+                    seeds['r_weight'] += 1
+                    torch.manual_seed(seeds['r_weight'])
+                    randomize_tensor(v.data, start=0.1, end=8.0)
+                    torch.manual_seed(100)
+
+                for k, v in sub_module.named_parameters():
+                    if node_info.param_masks is not None and k in node_info.param_masks:
+                        sub_module.register_parameter(
+                            k,
+                            torch.nn.Parameter(v * node_info.param_masks[k])
+                        )
+
+            output_values = node_info.flatten_caller(*input_values_masked)
+
+            # output_masks_merged = map_recursive_zip(merge_one_mask, output_masks)
+
+            output_masks = map_recursive(self.calc_one_mask, output_values)
+            node_info.out_mask_clone_0 = output_masks
+
+            output_names = node_info.slots_out
+            if len(output_names) == 1:
+                output_name = output_names[0]
+                self.slots[output_name].mask_1 = output_masks
+                self.slots[output_name].status['mask_1'] += 1
+            else:
+                assert len(output_names) == len(output_masks)
+                for output_name, output_mask in zip(output_names, output_masks):
+                    self.slots[output_name].mask_1 = output_mask
+                    self.slots[output_name].status['mask_1'] += 1
+
 
     def update_indirect_sparsity(self, node):
         """
@@ -347,19 +576,105 @@ class ModelSpeedup:
                 debug_name = input_debugname[in_id]
 
                 last_output = self.internal_result[debug_name]
-                # if isinstance(last_output, torch.Tensor):
-                # TODO what if last output is tuple/list of tensor
-                if last_output.grad is not None and tin.grad is not None:
-                    last_output.grad.data += tin.grad.data
-                elif last_output.grad is None:
-                    last_output.grad = tin.grad
-                elif last_output.grad is not None and tin.grad is None:
-                    # for example, tin.view(batch, tin.size(1)/2, tin.view(2)*2)
-                    # the size operation of tin will have no gradient
-                    continue
+                if isinstance(last_output, (tuple, list)):
+                    for i, out in enumerate(last_output):
+                        if isinstance(out, torch.Tensor) and out.numel() != 1:
+                            if out.grad is not None and tin[i].grad is not None:
+                                out.grad.data += tin[i].grad.data
+                            elif out.grad is None:
+                                out.grad = tin[i].grad
+                            elif out.grad is not None and tin[i].grad is None:
+                                # for example, tin.view(batch, tin.size(1)/2, tin.view(2)*2)
+                                # the size operation of tin will have no gradient
+                                continue
+                else:
+                    if last_output.grad is not None and tin.grad is not None:
+                        last_output.grad.data += tin.grad.data
+                    elif last_output.grad is None:
+                        last_output.grad = tin.grad
+                    elif last_output.grad is not None and tin.grad is None:
+                        # for example, tin.view(batch, tin.size(1)/2, tin.view(2)*2)
+                        # the size operation of tin will have no gradient
+                        continue
         else:
             _logger.warning(
                 'Note: %s does not have corresponding mask inference object', node.name)
+
+    def r_update_indirect_sparsity(self, node):
+        self.node_infos: dict[NodePyIO, NodeInfo]
+        self.slots: dict[str, Slot]
+
+        module_name = node.name
+        unique_name = node.unique_name
+        node_info = self.node_infos[node]
+
+        _logger.info('r_Update the indirect sparsity for the %s', unique_name)
+
+        # update indirect out mask
+        def calc_indirect_one_mask(mask, obj):
+            if self.tensor_propagate_check(obj):
+                assert isinstance(mask, torch.Tensor) and obj.shape == mask.shape
+                if obj.grad is not None:
+                    gradient_sum = torch.sum(torch.abs(obj.grad.data), dim=0)
+                    _grad_zero = gradient_sum == 0
+                    new_mask = mask.clone()
+                    for batchid in range(obj.size(0)):
+                        # set the same mask value for the whole batche
+                        new_mask[batchid][_grad_zero] = 0
+                    return new_mask
+            return mask
+
+        output_values = map_recursive(self.slot_getter_value_orig_inplace, node_info.slots_out)
+        if node.op_type == 'prim::ListConstruct':
+            output_values = output_values[0]
+        output_mask_indirect = map_recursive_zip(calc_indirect_one_mask, node_info.out_mask_clone_0, output_values)
+        node_info.out_mask_clone_1 = output_mask_indirect
+
+        output_names = node_info.slots_out
+        if len(output_names) == 1:
+            output_name = output_names[0]
+            self.slots[output_name].mask_2 = output_mask_indirect
+            self.slots[output_name].status['mask_2'] += 1
+        else:
+            assert len(output_names) == len(output_mask_indirect)
+            for output_name, output_mask in zip(output_names, output_mask_indirect):
+                self.slots[output_name].mask_2 = output_mask
+                self.slots[output_name].status['mask_2'] += 1
+
+        # init apply input
+        # randomized, so it's same to use slot_getter_value_orig or slot_getter_value_orig_inplace
+        input_values = map_recursive(self.slot_getter_value_orig_inplace, node_info.slots_in)
+        input_values_randomized = map_recursive(self.clone_randomizer, input_values)
+
+        input_masks = map_recursive(self.slot_getter_mask_1, node_info.slots_in)
+        input_values_masked = map_recursive_zip(self.mask_applier, input_values_randomized, input_masks)
+        map_recursive(self.tensor_requires_grad, input_values_masked)
+
+        if isinstance(node_info.flatten_caller, nn.Module):
+            sub_module = node_info.flatten_caller
+            for k, v in sub_module.named_parameters():
+                if node_info.param_masks is not None and k in node_info.param_masks and v.dtype in torch_float_dtype:
+                    self.tensor_requires_grad(v)
+
+        output_values = node_info.flatten_caller(*input_values_masked)
+
+        def update_indirect_weight_mask_helper(output, mask):
+            # Note: output maybe tensor or list/tuple of tensors
+            if self.tensor_propagate_check(output):
+                assert isinstance(mask, torch.Tensor)
+                if output.grad_fn is not None:
+                    output.backward(mask)
+            else:
+                assert not isinstance(mask, torch.Tensor)
+
+        map_recursive_zip(update_indirect_weight_mask_helper, output_values, node_info.out_mask_clone_1)
+        if isinstance(node_info.flatten_caller, nn.Module):
+            sub_module = node_info.flatten_caller
+            for k, v in sub_module.named_parameters():
+                if node_info.param_masks is not None and k in node_info.param_masks:
+                    grad_zero = v.grad.data == 0
+                    node_info.param_masks[k][grad_zero] = 0
+
 
     def _vnode_to_value(self, c_node):
         """
@@ -555,58 +870,80 @@ class ModelSpeedup:
                     self.intermediate_masks[name] = torch.ones_like(value)
 
     def r_initialize_propagate(self):
-        self.node_infos: dict[NodePyIO, dict[str, Any]] = {}
-        self.slots: dict[str, dict[str, Any]] = {}
-        
+        self.node_infos: dict[NodePyIO, NodeInfo] = {}
+        self.slots: dict[str, Slot] = {}
+
         for node in self.torch_graph.nodes_py.nodes_op:
             node: NodePyGroup
-            c_node:torch._C.Node = node.key_node
-
-            slots_in = list(i.debugName() for i in c_node.inputs())
-            slots_out = list(i.debugName() for i in c_node.output())
 
             if node.type == 'func':
+                c_node:torch._C.Node = node.key_node
+                slots_in = list(i.debugName() for i in c_node.inputs())
+                slots_out = list(i.debugName() for i in c_node.outputs())
                 flatten_caller = r_jit_to_python_function(node)
             else:
+                slots_in = node.inputs
+                slots_out = node.outputs
                 flatten_caller = get_module_by_name(self.bound_model, node.name)[1]
 
-            self.node_infos[node] = {
-                'slots_in': slots_in,
-                'slots_out': slots_out,
-                'flatten_caller': None,
-            }
-            for slot_name in (*slots_in, *slots_out):
-                if slot_name not in self.slots:
-                    self.slots[slot_name] = {
-                        'value_orig': None,
-                        'value_clone_1': None,
-                        'value_clone_2': None,
-                        'value_clone_3': None,
-                        'mask_orig': None,
-                        'mask_clone_1': None,
-                        'mask_clone_2': None,
-                        'mask_clone_3': None,
-                    }
+            self.node_infos[node] = NodeInfo(
+                slots_in,
+                slots_out,
+                flatten_caller,
+                self.masks.get(node.name, None)
+            )
+            if len(slots_out) != 1:
+                # assert prim::output/listunpack/tupleunpack
+                pass
 
-        for graph_input in self.torch_graph.trace.graph.inputs():
-            if graph_input.type().kind() == 'ClassType':
-                self.slots[graph_input.debugName()]['value_orig'] = self.bound_model
-                break
-        
         @run_onlyif_instance(torch.Tensor)
         def value_rand_init(obj: torch.Tensor):
             torch.manual_seed(100)
             return torch.rand_like(obj)
 
-        @run_onlyif_instance(torch.Tensor)
+        @run_onlyif_instance(torch.Tensor, False)
         def mask_ones_init(obj: torch.Tensor):
             return torch.ones_like(obj)
+
+        for c_node in self.torch_graph.trace.graph.nodes():
+            c_node: torch._C.Node
+
+            slots_in = list(i.debugName() for i in c_node.inputs())
+            slots_out = list(i.debugName() for i in c_node.outputs())
+            for slot_name in (*slots_in, *slots_out):
+                if slot_name not in self.slots:
+                    self.slots[slot_name] = Slot()
+
+            if c_node.kind() == 'prim::Constant':
+                c_value: torch._C.Value = c_node.output()
+                value = c_value.toIValue()
+                self.slots[c_value.debugName()].value_orig = value
+                self.slots[c_value.debugName()].value_orig_inplace = map_recursive(self.tensor_cloner, value)
+                self.slots[c_value.debugName()].status['value_0'] += 1
+
+                self.slots[c_value.debugName()].mask_1 = map_recursive(mask_ones_init, value)
+                self.slots[c_value.debugName()].status['mask_1'] += 1
+
+        for graph_input in self.torch_graph.trace.graph.inputs():
+            if graph_input.type().kind() == 'ClassType':
+                if graph_input.debugName() not in self.slots:
+                    self.slots[graph_input.debugName()] = Slot()
+                self.slots[graph_input.debugName()].value_orig = self.bound_model
+                self.slots[graph_input.debugName()].value_orig_inplace = self.bound_model
+                self.slots[graph_input.debugName()].status['value_0'] += 1
+
+                self.slots[graph_input.debugName()].mask_1 = map_recursive(mask_ones_init, self.bound_model)
+                self.slots[graph_input.debugName()].status['mask_1'] += 1
 
         for name, nodeio in self.torch_graph.nodes_py.nodes_io.items():
             if nodeio.input_or_output == 'input':
                 value = self._vnode_to_value(self.debugname_to_value[name])
-                self.slots[name]['value_orig'] = map_recursive(value, value_rand_init)
-                self.slots[name]['mask_orig'] = map_recursive(value, mask_ones_init)
+                self.slots[name].value_orig = value
+                self.slots[name].value_orig_inplace = map_recursive(value_rand_init, value)
+                self.slots[name].status['value_0'] += 1
+
+                self.slots[name].mask_1 = map_recursive(mask_ones_init, value)
+                self.slots[name].status['mask_1'] += 1
 
     def speedup_model(self):
         """
@@ -627,40 +964,48 @@ class ModelSpeedup:
         self.r_initialize_propagate()
 
         _logger.info("propagate original variables")
-        torch.manual_seed(100)r_
+        torch.manual_seed(100)
         seeds['inter_var'] = 1000
         seeds['weight'] = 1000
+        seeds['r_inter_var'] = 1000
+        seeds['r_weight'] = 1000
         for node in self.direct_order():
             self.propagate_orig(node)
             self.r_propagate_orig(node)
         print('inter var1:')
-        print([(k, torch.sum(v.orig_output)) for k, v in self.auto_inferences.items()])
+        print([(k, self.debug_hash_value(v.orig_output)) for k, v in self.auto_inferences.items()])
         print('inter var1.5:')
-        print([(k, v.orig_output.grad is None) for k, v in self.auto_inferences.items()])
+        print([(k, v.orig_output.grad is None if isinstance(v.orig_output, torch.Tensor) else v.orig_output) for k, v in self.auto_inferences.items()])
 
         _logger.info("update direct sparsity")
         torch.manual_seed(100)
         seeds['inter_var'] = 1000
         seeds['weight'] = 1000
+        seeds['r_inter_var'] = 1000
+        seeds['r_weight'] = 1000
         for node in self.direct_order():
             self.update_direct_sparsity(node)
+            self.r_update_direct_sparsity(node)
         print('inter var2:')
-        print([(k, [(torch.manual_seed(100), torch.sum(torch.rand_like(i.to(torch.float)) * i))[1] for i in v.in_masks]) for k, v in self.auto_inferences.items()])
+        print([(k, [self.debug_hash_value(i) for i in v.in_masks]) for k, v in self.auto_inferences.items()])
         print('inter var3:')
-        print([(k, (torch.manual_seed(100), torch.sum(torch.rand_like(v.out_masks.to(torch.float)) * v.out_masks))[1]) for k, v in self.auto_inferences.items()])
+        print([(k, self.debug_hash_value(v)) for k, v in self.auto_inferences.items()])
         print('inter var4:')
-        print([(ko, [(ki, (torch.manual_seed(100), torch.sum(torch.rand_like(vi.to(torch.float)) * vi))[1]) for ki, vi in vo.items()]) for ko, vo in self.masks.items() if not ko.startswith('.')])
+        print([(ko, [(ki, self.debug_hash_value(vi)) for ki, vi in vo.items()]) for ko, vo in self.masks.items() if not ko.startswith('.')])
         print('inter var4.5:')
-        print([(k, v.orig_output.grad is None) for k, v in self.auto_inferences.items()])
+        print([(k, v.orig_output.grad is None) for k, v in self.auto_inferences.items() if isinstance(v.orig_output, torch.Tensor)])
 
         _logger.info("update indirect sparsity")
         torch.manual_seed(100)
         seeds['inter_var'] = 1000
         seeds['weight'] = 1000
+        seeds['r_inter_var'] = 1000
+        seeds['r_weight'] = 1000
         for node in self.indirect_order():
             self.update_indirect_sparsity(node)
+            self.r_update_indirect_sparsity(node)
         print('inter var5:')
-        print([(k, (torch.manual_seed(100), torch.sum(torch.rand_like(v.out_masks.to(torch.float)) * v.out_masks))[1]) for k, v in self.auto_inferences.items()])
+        print([(k, self.debug_hash_value(v.out_masks)) for k, v in self.auto_inferences.items() if isinstance(v, torch.Tensor)])
         # print('inter var6:')
         # print([(k, (torch.manual_seed(100), torch.sum(torch.rand_like(v.out_masks.to(torch.float)) * v.out_masks))[1]) for k, v in self.auto_inferences.items()])
         _logger.info('resolve the mask conflict')

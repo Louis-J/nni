@@ -157,6 +157,36 @@ def tupleunpack_python(_node: NodePyGroup, _speedup: ModelSpeedup) -> Optional[C
     # the end of the model, and is no need to replace/propagate mask
     return None
 
+def list_construct_python(node: NodePyGroup, speedup: ModelSpeedup) -> Optional[Callable]:
+    c_node = node.key_node
+
+    positional_num = 9999
+    keyword_list = []
+    undetermined_special_treat = {}
+
+    input_nodes = list(c_node.inputs())
+    positional, keyword, undetermined = parse_input_value(speedup, input_nodes, positional_num, keyword_list)
+
+    def func(*args):
+        return list(args)
+
+    return FuncAdapter(func, positional, keyword, undetermined, undetermined_special_treat)
+
+def tuple_construct_python(node: NodePyGroup, speedup: ModelSpeedup) -> Optional[Callable]:
+    c_node = node.key_node
+
+    positional_num = 9999
+    keyword_list = []
+    undetermined_special_treat = {}
+
+    input_nodes = list(c_node.inputs())
+    positional, keyword, undetermined = parse_input_value(speedup, input_nodes, positional_num, keyword_list)
+
+    def func(*args):
+        return tuple(args)
+
+    return FuncAdapter(func, positional, keyword, undetermined, undetermined_special_treat)
+
 def num2tensor_python(_node: NodePyGroup, _speedup: ModelSpeedup):
     return torch.nn.Identity()
 
@@ -765,8 +795,10 @@ trans_func_dict = {
     'aten::cat': cat_python,
     'aten::Int': partial(generate_aten_to_python, torch._C._TensorBase.int),
 
-    'prim::TupleUnpack': tupleunpack_python,
+    'prim::ListConstruct': list_construct_python,
+    'prim::TupleConstruct': tuple_construct_python,
     'prim::ListUnpack': tupleunpack_python,
+    'prim::TupleUnpack': tupleunpack_python,
     'prim::NumToTensor': num2tensor_python,
     'prim::GetAttr': getattr_python,
 }

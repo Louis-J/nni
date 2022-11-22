@@ -380,7 +380,8 @@ class TorchModuleGraph(TorchGraph):
         while not node_queue.empty():
             curr_node = node_queue.get()
             for _input in curr_node.inputs():
-                if _input.node().kind() == CONSTANT_KIND:
+                # if _input.node().kind() == CONSTANT_KIND:
+                if _input.node().kind() in (CONSTANT_KIND, GETATTR_KIND):
                     continue
                 input_name = _input.debugName()
                 if input_name in output_to_node:
@@ -395,7 +396,8 @@ class TorchModuleGraph(TorchGraph):
                 else:
                     inputs.append(input_name)
             for _output in curr_node.outputs():
-                if _output.node().kind() == CONSTANT_KIND:
+                # if _output.node().kind() == CONSTANT_KIND:
+                if _output.node().kind() in (CONSTANT_KIND, GETATTR_KIND):
                     continue
                 output_name = _output.debugName()
                 if output_name in input_to_node:
@@ -608,7 +610,8 @@ class TorchModuleGraph(TorchGraph):
             # the nodes that start with 'aten' are key function
             # nodes
             return True
-        if node_cpp.kind() in [LIST_UNPACK_KIND, TUPLE_UNPACK_KIND]:
+        # if node_cpp.kind() in [LIST_UNPACK_KIND, TUPLE_UNPACK_KIND]:
+        if node_cpp.kind() in [LIST_UNPACK_KIND, TUPLE_UNPACK_KIND, LIST_CONSTRUCT_KIND, TUPLE_CONSTRUCT_KIND, 'prim::NumToTensor']:
             # We cannot merge the List/Tuple
             # Unpack func into other nodes, else it
             # may lead to a graph construction error.
@@ -636,7 +639,8 @@ class TorchModuleGraph(TorchGraph):
             if node.op_type in [TUPLE_UNPACK_KIND, LIST_UNPACK_KIND]:
                 unpack_cpp = node.key_node
                 last_cpp = list(unpack_cpp.inputs())[0].node()
-                if last_cpp.kind() in [TUPLE_CONSTRUCT_KIND, LIST_CONSTRUCT_KIND]:
+                # if last_cpp.kind() in [TUPLE_CONSTRUCT_KIND, LIST_CONSTRUCT_KIND]:
+                if last_cpp.kind() in []:
                     # we need check if the tensor tuple or tensor list is produced
                     # by a list/tuple construct node. If so, we can unpack the tuple
                     # or list manunally.

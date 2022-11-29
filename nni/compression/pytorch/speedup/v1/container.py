@@ -1,3 +1,5 @@
+from typing import Union
+
 import torch
 from torch import nn
 
@@ -23,7 +25,7 @@ class Slot:
         }
 
 class NodeInfo:
-    def __init__(self, slots_in: list[dir], slots_out: list[dir], flatten_caller, param_masks: dict[str, torch.Tensor]) -> None:
+    def __init__(self, slots_in: list[str], slots_out: Union[list[str], str], flatten_caller, param_masks: dict[str, torch.Tensor]) -> None:
         self.slots_in = slots_in
         self.slots_out = slots_out
         self.flatten_caller = flatten_caller
@@ -34,9 +36,9 @@ class NodeInfo:
         self.out_mask_clone_0 = None
         self.out_mask_clone_1 = None
         self.out_mask_clone_2 = None
-        self.param_masks_clone_0 = None
-        self.param_masks_clone_1 = None
-        self.param_masks_clone_2 = None
+        self.param_masks_clone_0 = {}
+        self.param_masks_clone_1 = {}
+        self.param_masks_clone_2 = {}
         self.status = {
             'in_0': 0,
             'in_1': 0,

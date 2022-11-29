@@ -397,13 +397,12 @@ special_treat_dict = {
 schema_fix_dict = {
     # functinon 'to', 'randint', and 'sparse_coo_tensor' has different schema between python and c++.
     # https://pytorch.org/docs/stable/jit_unsupported.html#ops-with-divergent-schemas-between-torch-python
-    """aten::to.device(Tensor(a) self, Device device, int dtype, bool non_blocking=False, bool copy=False, int? memory_format=None) -> (Ten
-    sor(a))""":
+    'to.device':
         """aten::to.device(Tensor(a) self, Device device, int dtype, bool non_blocking=False, bool copy=False, *, int? memory_format=None)
          -> (Tensor(a))""",
-    'aten::to.dtype(Tensor(a) self, int dtype, bool non_blocking=False, bool copy=False, int? memory_format=None) -> (Tensor(a))':
+    'to.dtype':
         'aten::to.dtype(Tensor(a) self, int dtype, bool non_blocking=False, bool copy=False, *, int? memory_format=None) -> (Tensor(a))',
-    'aten::to.other(Tensor(a) self, Tensor other, bool non_blocking=False, bool copy=False, int? memory_format=None) -> (Tensor(a))':
+    'to.other':
         'aten::to.other(Tensor(a) self, Tensor other, bool non_blocking=False, bool copy=False, *, int? memory_format=None) -> (Tensor(a))',
 
     # todo: are the arguments 'pin_memory' and 'requires_grad' related?
@@ -431,8 +430,9 @@ def parse_aten_schema(schema: str):
     Parse the schema, to positional_num and keyword_list, and detect if the argument should be specially treated.
     only available on pytorch >= v1.9.0
     """
-    if schema in schema_fix_dict:
-        schema = schema_fix_dict[schema]
+    name_with_overload = schema[6:schema.find('(')]
+    if name_with_overload in schema_fix_dict:
+        schema = schema_fix_dict[name_with_overload]
 
     positional_num = 0
     keyword_list = list()
@@ -462,8 +462,9 @@ def parse_aten_schema_version_1_8_x(schema: str):
     Using a lexer-parser like method to parse it.
     Re-write from torch/csrc/jit/frontend/function_schema_parser.cpp
     """
-    if schema in schema_fix_dict:
-        schema = schema_fix_dict[schema]
+    name_with_overload = schema[6:schema.find('(')]
+    if name_with_overload in schema_fix_dict:
+        schema = schema_fix_dict[name_with_overload]
 
     single_solid_tokens = [
         '(', ')', '[', ']',

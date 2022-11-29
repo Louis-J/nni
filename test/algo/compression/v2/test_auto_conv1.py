@@ -172,7 +172,7 @@ class TorchModel1(torch.nn.Module):
         # reason: the graph_utils assumes modules with no sub_module are leaf_modules.
         #         so the asub will be treated as a leaf_module.
         # x = self.asub(x)
-        x = torch.constant_pad_nd(x, (1,1,1,1), 3.14159)
+        x = torch.constant_pad_nd(x, (0,0,0,0), 3.14159)
 
         return x
 
@@ -180,7 +180,7 @@ class AutoConvTestCase(unittest.TestCase):
     def test_l1norm_pruner(self):
         torch.manual_seed(100)
         model = TorchModel1()
-        dummy_input = torch.rand(3, 1, 28, 28)
+        dummy_input = torch.rand(8, 1, 28, 28)
         config_list = [{'op_types': ['Conv2d'], 'sparsity': 0.5}]
         pruner = L1NormPruner(model=model, config_list=config_list)
         pruned_model, masks = pruner.compress()
@@ -197,7 +197,7 @@ class AutoConvTestCase(unittest.TestCase):
         assert 0.45 < real_sparsity_list[0]['total_sparsity'] < 0.75
 
         print('the shape of output of the infer:', model(dummy_input).shape)
-        assert model(dummy_input).shape == torch.Size((5, 5))
+        assert model(dummy_input).shape == torch.Size((8, 8))
 
 if __name__ == '__main__':
     # unittest.main()

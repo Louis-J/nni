@@ -198,9 +198,9 @@ class AutoMaskInference:
                     # issue-4540 when two tensors are multiplied, the constants part make
                     # the propagation weaker, and lead to shape misaligment. Currently, we
                     # donnot support the constant folding, so, we just remove the constant here
-                    in_tensor.data = in_tensor.data * self.in_masks[tid]
+                    # in_tensor.data = in_tensor.data * self.in_masks[tid]
                     # in_tensor.data *= self.in_masks[tid]
-                    # in_tensor *= self.in_masks[tid]
+                    in_tensor *= self.in_masks[tid]
         return input
 
     def apply_weight_mask(self):

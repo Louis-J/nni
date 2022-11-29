@@ -102,7 +102,7 @@ class ModelSpeedup:
             else:
                 in_degree[node.unique_name] = len(predecessors)
         while len(visit_queue) != 0:
-            node = visit_queue.popleft()
+            node: NodePyGroup = visit_queue.popleft()
             successors = self.torch_graph.find_successors(node.unique_name)
             successors = sorted(set(successors), key = successors.index)
             for successor in successors:
@@ -124,7 +124,7 @@ class ModelSpeedup:
             else:
                 out_degree[node.unique_name] = len(successors)
         while len(visit_queue) != 0:
-            node = visit_queue.popleft()
+            node: NodePyGroup = visit_queue.popleft()
             predecessors = self.torch_graph.find_predecessors(node.unique_name)
             predecessors = sorted(set(predecessors), key = predecessors.index)
             for predecessor in predecessors:
@@ -136,9 +136,15 @@ class ModelSpeedup:
         assert len(out_degree) == 0
 
     def debug_hash_value_one(self, obj):
-        if self.tensor_propagate_check(obj):
+        if isinstance(obj, torch.Tensor) and obj.numel() > 1:
             torch.manual_seed(100)
-            return torch.sum(torch.rand_like(obj.to(torch.float)) * obj)[0]
+            out = torch.sum(torch.rand_like(obj.to(torch.float)) * obj).item()
+            if obj.grad is not None:
+                torch.manual_seed(100)
+                grad = torch.sum(torch.rand_like(obj.grad.to(torch.float)) * obj.grad).item()
+                return [out, 'grad: %s' % grad]
+            else:
+                return [out, 'no grad']
         else:
             return obj
 
@@ -146,7 +152,8 @@ class ModelSpeedup:
         return map_recursive(self.debug_hash_value_one, obj)
 
     def tensor_propagate_check(self, obj):
-        return isinstance(obj, torch.Tensor) and obj.dim() > self.batch_dim and obj.size(self.batch_dim) == self.confidence
+        # return isinstance(obj, torch.Tensor) and obj.dim() > self.batch_dim and obj.size(self.batch_dim) == self.confidence
+        return isinstance(obj, torch.Tensor) and obj.numel() > self.confidence and obj.numel() % self.confidence == 0
 
     def tensor_detacher(self, obj: torch.Tensor):
         if self.tensor_propagate_check(obj):
@@ -172,10 +179,19 @@ class ModelSpeedup:
 
         return self.slots[input_name].value_orig_inplace
 
+    def slot_getter_value_1(self, input_name: str):
+        assert isinstance(input_name, str)
+        assert input_name in self.slots, 'slot error: lack of slot(%s)' % input_name
+        assert self.slots[input_name].status['value_1'] >= 1, 'slot error: bad value_1(%d)' % self.slots[input_name].status['value_1']
+
+        return self.slots[input_name].value_clone_1
+
     def clone_randomizer(self, obj):
         import copy
-        if self.tensor_propagate_check(obj):
-            new_obj = obj.clone()
+        # if self.tensor_propagate_check(obj):
+        if isinstance(obj, torch.Tensor) and obj.numel() != 1 and len(obj.size()) > self.batch_dim\
+            and obj.size(self.batch_dim) == self.confidence:
+            new_obj = obj.clone().detach()
             if not new_obj.is_contiguous():
                 new_obj = new_obj.contiguous()
             seeds['r_inter_var'] += 1
@@ -199,9 +215,24 @@ class ModelSpeedup:
     def slot_getter_mask_2(self, input_name: str):
         assert isinstance(input_name, str)
         assert input_name in self.slots, 'slot error: lack of slot(%s)' % input_name
-        assert self.slots[input_name].status['mask_2'] == 1, 'slot error: bad mask_2(%d)' % self.slots[input_name].status['mask_2']
+        if self.slots[input_name].mask_2 is None:
+            return None
+        else:
+            assert self.slots[input_name].status['mask_2'] >= 1, 'slot error: bad mask_2(%d)' % self.slots[input_name].status['mask_2']
 
-        return self.slots[input_name].mask_2
+            return self.slots[input_name].mask_2
+
+    def slot_getter_mask_2_or_1(self, input_name: str):
+        assert isinstance(input_name, str)
+        assert input_name in self.slots, 'slot error: lack of slot(%s)' % input_name
+        if self.slots[input_name].mask_2 is None:
+            assert self.slots[input_name].status['mask_1'] == 1, 'slot error: bad mask_1(%d)' % self.slots[input_name].status['mask_1']
+
+            return self.slots[input_name].mask_1
+        else:
+            assert self.slots[input_name].status['mask_2'] >= 1, 'slot error: bad mask_2(%d)' % self.slots[input_name].status['mask_2']
+
+            return self.slots[input_name].mask_2
 
     def slot_getter_mask_3(self, input_name: str):
         assert isinstance(input_name, str)
@@ -406,7 +437,9 @@ class ModelSpeedup:
             func = jit_to_python_function(node, self)
             # update the output result into self.internal_result, so that
             # the successor nodes can take these output tensors as inputs.
-            self.internal_result[out_debugname] = func(*dummy_input)
+            out = func(*dummy_input)
+            out = map_recursive(self.tensor_cloner, out)
+            self.internal_result[out_debugname] = out
 
             # function doesn't have weights
             auto_infer = AutoMaskInference(
@@ -418,7 +451,9 @@ class ModelSpeedup:
             _, module = get_module_by_name(self.bound_model, module_name)
             # update the output result into self.internal_result, so that
             # the successor nodes can take these output tensors as inputs.
-            self.internal_result[out_debugname] = module(*dummy_input)
+            out = module(*dummy_input)
+            out = map_recursive(self.tensor_cloner, out)
+            self.internal_result[out_debugname] = out
 
             auto_infer = AutoMaskInference(
                 out_debugname, module, self, dummy_input, weight_mask,
@@ -442,18 +477,17 @@ class ModelSpeedup:
 
         output_values = node_info.flatten_caller(*input_value_detachs)
 
-        output_names = node_info.slots_out
-        if len(output_names) == 1:
-            output_name = output_names[0]
-            self.slots[output_name].value_orig = output_values
-            self.slots[output_name].value_orig_inplace = map_recursive(self.tensor_cloner, output_values)
-            self.slots[output_name].status['value_0'] += 1
+        if isinstance(node_info.slots_out, str):
+            slot_out = node_info.slots_out
+            self.slots[slot_out].value_orig = output_values
+            self.slots[slot_out].value_orig_inplace = map_recursive(self.tensor_cloner, output_values)
+            self.slots[slot_out].status['value_0'] += 1
         else:
-            assert len(output_names) == len(output_values)
-            for output_name, output_value in zip(output_names, output_values):
-                self.slots[output_name].value_orig = output_value
-                self.slots[output_name].value_orig_inplace = map_recursive(self.tensor_cloner, output_value)
-                self.slots[output_name].status['value_0'] += 1
+            assert len(node_info.slots_out) == len(output_values)
+            for slot_out, output_value in zip(node_info.slots_out, output_values):
+                self.slots[slot_out].value_orig = output_value
+                self.slots[slot_out].value_orig_inplace = map_recursive(self.tensor_cloner, output_value)
+                self.slots[slot_out].status['value_0'] += 1
 
     def update_direct_sparsity(self, node):
         module_name = node.name
@@ -499,15 +533,19 @@ class ModelSpeedup:
         _logger.info('r_Update mask for %s', unique_name)
 
         with torch.no_grad():
-            input_names = node_info.slots_in
             # randomized, so it's same to use slot_getter_value_orig or slot_getter_value_orig_inplace
-            input_values = map_recursive(self.slot_getter_value_orig_inplace, input_names)
-            input_values_randomized = map_recursive(self.clone_randomizer, input_values)
+            # input_values = map_recursive(self.slot_getter_value_orig, node_info.slots_in)
+            # input_values_randomized = map_recursive(self.clone_randomizer, input_values)
+            for slot_in in node_info.slots_in:
+                self.slots[slot_in].value_clone_1 = map_recursive(self.clone_randomizer, self.slots[slot_in].value_orig)
+                self.slots[slot_in].status['value_1'] += 1
 
-            input_masks = map_recursive(self.slot_getter_mask_1, input_names)
-            input_values_masked = map_recursive_zip(self.mask_applier, input_values_randomized, input_masks)
+            input_values = map_recursive(self.slot_getter_value_1, node_info.slots_in)
 
-            node_info.in_mask_clone_0 = map_recursive(self.tensor_cloner, input_masks)
+            input_masks = map_recursive(self.slot_getter_mask_1, node_info.slots_in)
+            input_values = map_recursive_zip(self.mask_applier, input_values, input_masks)
+
+            # node_info.in_mask_clone_0 = map_recursive(self.tensor_cloner, input_masks)
 
             if isinstance(node_info.flatten_caller, nn.Module):
                 sub_module = node_info.flatten_caller
@@ -518,27 +556,24 @@ class ModelSpeedup:
                     torch.manual_seed(100)
 
                 for k, v in sub_module.named_parameters():
-                    if node_info.param_masks is not None and k in node_info.param_masks:
-                        sub_module.register_parameter(
-                            k,
-                            torch.nn.Parameter(v * node_info.param_masks[k])
-                        )
+                    sub_module.register_parameter(
+                        k,
+                        torch.nn.Parameter(v * node_info.param_masks[k])
+                    )
 
-            output_values = node_info.flatten_caller(*input_values_masked)
+            output_values = node_info.flatten_caller(*input_values)
 
             # output_masks_merged = map_recursive_zip(merge_one_mask, output_masks)
 
             output_masks = map_recursive(self.calc_one_mask, output_values)
-            node_info.out_mask_clone_0 = output_masks
 
-            output_names = node_info.slots_out
-            if len(output_names) == 1:
-                output_name = output_names[0]
+            if isinstance(node_info.slots_out, str):
+                output_name = node_info.slots_out
                 self.slots[output_name].mask_1 = output_masks
                 self.slots[output_name].status['mask_1'] += 1
             else:
-                assert len(output_names) == len(output_masks)
-                for output_name, output_mask in zip(output_names, output_masks):
+                assert len(node_info.slots_out) == len(output_masks)
+                for output_name, output_mask in zip(node_info.slots_out, output_masks):
                     self.slots[output_name].mask_1 = output_mask
                     self.slots[output_name].status['mask_1'] += 1
 
@@ -611,11 +646,11 @@ class ModelSpeedup:
         _logger.info('r_Update the indirect sparsity for the %s', unique_name)
 
         # update indirect out mask
-        def calc_indirect_one_mask(mask, obj):
+        def calc_indirect_mask(mask, obj):
             if self.tensor_propagate_check(obj):
                 assert isinstance(mask, torch.Tensor) and obj.shape == mask.shape
                 if obj.grad is not None:
-                    gradient_sum = torch.sum(torch.abs(obj.grad.data), dim=0)
+                    gradient_sum = torch.sum(torch.abs(obj.grad), dim=0)
                     _grad_zero = gradient_sum == 0
                     new_mask = mask.clone()
                     for batchid in range(obj.size(0)):
@@ -624,39 +659,36 @@ class ModelSpeedup:
                     return new_mask
             return mask
 
-        output_values = map_recursive(self.slot_getter_value_orig_inplace, node_info.slots_out)
-        if node.op_type == 'prim::ListConstruct':
-            output_values = output_values[0]
-        output_mask_indirect = map_recursive_zip(calc_indirect_one_mask, node_info.out_mask_clone_0, output_values)
-        node_info.out_mask_clone_1 = output_mask_indirect
+        output_values = map_recursive(self.slot_getter_value_1, node_info.slots_out)
+        output_masks_1 = map_recursive(self.slot_getter_mask_1, node_info.slots_out)
+        output_masks_2 = map_recursive_zip(calc_indirect_mask, output_masks_1, output_values)
 
-        output_names = node_info.slots_out
-        if len(output_names) == 1:
-            output_name = output_names[0]
-            self.slots[output_name].mask_2 = output_mask_indirect
+        if isinstance(node_info.slots_out, str):
+            output_name = node_info.slots_out
+            self.slots[output_name].mask_2 = output_masks_2
             self.slots[output_name].status['mask_2'] += 1
         else:
-            assert len(output_names) == len(output_mask_indirect)
-            for output_name, output_mask in zip(output_names, output_mask_indirect):
+            assert len(node_info.slots_out) == len(output_masks_2)
+            for output_name, output_mask in zip(node_info.slots_out, output_masks_2):
                 self.slots[output_name].mask_2 = output_mask
                 self.slots[output_name].status['mask_2'] += 1
 
         # init apply input
         # randomized, so it's same to use slot_getter_value_orig or slot_getter_value_orig_inplace
-        input_values = map_recursive(self.slot_getter_value_orig_inplace, node_info.slots_in)
-        input_values_randomized = map_recursive(self.clone_randomizer, input_values)
+        input_values = map_recursive(self.slot_getter_value_orig, node_info.slots_in)
+        input_values = map_recursive(self.clone_randomizer, input_values)
 
         input_masks = map_recursive(self.slot_getter_mask_1, node_info.slots_in)
-        input_values_masked = map_recursive_zip(self.mask_applier, input_values_randomized, input_masks)
-        map_recursive(self.tensor_requires_grad, input_values_masked)
+        input_values = map_recursive_zip(self.mask_applier, input_values, input_masks)
+        map_recursive(self.tensor_requires_grad, input_values)
 
         if isinstance(node_info.flatten_caller, nn.Module):
             sub_module = node_info.flatten_caller
             for k, v in sub_module.named_parameters():
-                if node_info.param_masks is not None and k in node_info.param_masks and v.dtype in torch_float_dtype:
+                if v.dtype in torch_float_dtype:
                     self.tensor_requires_grad(v)
 
-        output_values = node_info.flatten_caller(*input_values_masked)
+        output_values = node_info.flatten_caller(*input_values)
 
         def update_indirect_weight_mask_helper(output, mask):
             # Note: output maybe tensor or list/tuple of tensors
@@ -667,14 +699,32 @@ class ModelSpeedup:
             else:
                 assert not isinstance(mask, torch.Tensor)
 
-        map_recursive_zip(update_indirect_weight_mask_helper, output_values, node_info.out_mask_clone_1)
+        out_masks = map_recursive(self.slot_getter_mask_2, node_info.slots_out)
+
+        map_recursive_zip(update_indirect_weight_mask_helper, output_values, out_masks)
         if isinstance(node_info.flatten_caller, nn.Module):
             sub_module = node_info.flatten_caller
             for k, v in sub_module.named_parameters():
-                if node_info.param_masks is not None and k in node_info.param_masks:
-                    grad_zero = v.grad.data == 0
-                    node_info.param_masks[k][grad_zero] = 0
+                grad_zero = v.grad.data == 0
+                node_info.param_masks_clone_0[k] = node_info.param_masks[k].clone()
+                node_info.param_masks_clone_0[k][grad_zero] = 0
 
+        # pass the gradient to the predecessor nodes
+        def pass_grad(slot_val, out):
+            if self.tensor_propagate_check(slot_val):
+                assert isinstance(slot_val, torch.Tensor)
+                if slot_val.grad is not None and out.grad is not None:
+                    # slot_val.grad.data += out.grad.data
+                    slot_val.grad += out.grad
+                elif slot_val.grad is None:
+                    slot_val.grad = out.grad
+                elif slot_val.grad is not None and out.grad is None:
+                    # for example, tin.view(batch, tin.size(1)/2, tin.view(2)*2)
+                    # the size operation of tin will have no gradient
+                    pass
+
+        input_values_1 = map_recursive(self.slot_getter_value_1, node_info.slots_in)
+        map_recursive_zip(pass_grad, input_values_1, input_values)
 
     def _vnode_to_value(self, c_node):
         """
@@ -701,109 +751,55 @@ class ModelSpeedup:
             assert value is not None, errmsg
             return value
 
-    def replace_compressed_modules(self):
-        """
-        Replace all the modules that have changed (weights/inputs/output) shape.
-        The new module is created using the same arguments of the to-be-replaced module,
-        and correctly inherits its weights.
 
-        NOTE: ```func``` type cannot be replaced as it is not a module, thus, one limitation
-        is that ```func``` should be not required to be replaced.
-        """
+    def r_replace_compressed_modules(self):
         with torch.no_grad():
-            for unique_name in self.auto_inferences:
-                self.replace_submodule(unique_name)
+            for node in self.direct_order():
+                self.r_replace_submodule(node)
 
+    def r_replace_submodule(self, node):
+        node: NodePyGroup
+        _logger.debug("replace %s, in %s type, with op_type %s", node.unique_name, node.type, node.op_type)
+        node_info = self.node_infos[node]
+        def tensors_flattener(masks):
+            flattened = []
+            def helper(obj):
+                if isinstance(obj, torch.Tensor) and obj.numel() > 1:
+                    flattened.append(obj)
+            map_recursive(helper, masks)
+            return flattened
 
-    def replace_submodule(self, unique_name, reindex_dim=None, reindex=None):
-        """
-        Replace the submodule according to the inferred sparsity.
-
-        Parameters
-        ----------
-        unique_name: str
-            The unique_name of the submodule to replace.
-        reindex_dim: int
-            The dimension of the re-index operation.
-        reindex: Reindex
-            The index tensor. Normally this variable is None. If we want to reindex the
-            output of this submodule, we can pass the index by this parameter.
-        """
-        class ReindexModule(nn.Module):
-            """
-            ReindexModule is used to resolve the mask conflict when replace the submodule.
-            Basically, we can use two ways to resolve the mask conflict: (1) unmask some
-            values(will introduce more computation overhead) (2) reindex and padd the output
-            tensor of the target op(introduce more memory access overhad). Currently this
-            method is shutdown, in the future, we will merge these two methods into a graph
-            pass which is used to resolve the mask conflict.
-            """
-
-            def __init__(self, ori_module, reindex_dim, reindex):
-                super(ReindexModule, self).__init__()
-                self.ori_module = ori_module
-                self.reindex_dim = reindex_dim
-                self.reindex = reindex
-                tmp_index = [slice(None, None) for i in range(reindex_dim+1)]
-                # the index for the tensor
-                tmp_index[reindex_dim] = reindex
-                self.t_index = tuple(tmp_index)
-
-            def forward(self, x):
-                tmpout = self.ori_module(x)
-                shape = list(tmpout.size())
-                shape[self.reindex_dim] = self.reindex.size(0)
-                out = torch.zeros(tuple(shape), device=tmpout.device,
-                                  requires_grad=tmpout.requires_grad)
-                out[self.t_index] = tmpout
-                return out
-        assert unique_name in self.auto_inferences
-        g_node = self.torch_graph.name_to_node[unique_name]
-        _logger.debug("replace %s, in %s type, with op_type %s",
-                      unique_name, g_node.type, g_node.op_type)
-        auto_infer = self.auto_inferences[unique_name]
-        if g_node.type == 'module':
-            if g_node.unique_name in self.torch_graph.reused_module:
-                if reindex_dim is not None:
-                    _logger.warning(
-                        'Cannot replace a reused module with padding operator!!')
-                    return None
-            super_module, leaf_module = get_module_by_name(
-                self.bound_model, g_node.name)
-            m_type = g_node.op_type
-            if (not m_type in replace_module) and (m_type not in self.customized_replace_func):
-                err_msg = f"Has not supported replacing module with type: {m_type}, "
+        if node.type == 'module':
+            super_module, leaf_module = get_module_by_name(self.bound_model, node.name)
+            if (not node.op_type in replace_module) and (node.op_type not in self.customized_replace_func):
+                err_msg = f"Has not supported replacing module with type: {node.op_type}, "
                 err_msg += f"you could report an issue at https://github.com/microsoft/nni. "
-                err_msg += f"If you know how to replace {m_type}, "
+                err_msg += f"If you know how to replace {node.op_type}, "
                 err_msg += f"you could implement module replacement by passing in"
                 err_msg += f"`customized_replace_func` to `{self.__class__.__name__}`. "
                 err_msg += f"You are welcome to contribute back to nni as native support if you have implemented the replacement function, "
                 err_msg += f"so that more users can benefit from your contributions."
                 raise RuntimeError(err_msg)
-            _logger.info("replace module (name: %s, op_type: %s)",
-                         g_node.name, m_type)
-            replace_function = self.customized_replace_func.get(m_type, replace_module.get(m_type, None))
-            compressed_module = replace_function(
-                leaf_module, auto_infer.get_masks())
+            _logger.info("replace module (name: %s, op_type: %s)", node.name, node.op_type)
+            replace_function = self.customized_replace_func.get(node.op_type, replace_module.get(node.op_type, None))
+
+            in_masks = tensors_flattener(map_recursive(self.slot_getter_mask_2_or_1, node_info.slots_in))
+            out_masks = map_recursive(self.slot_getter_mask_2_or_1, node_info.slots_out)
+            param_masks = node_info.param_masks_clone_0
+
+            compressed_module = replace_function(leaf_module, (in_masks, out_masks, param_masks))
             
-            print('inter var in replacement:')
-            print('replace module:', g_node.name)
+            print('\ninter var in replacement:')
+            print('replace module:', node.name)
             print('replace in_masks:')
-            print([(torch.manual_seed(100), torch.sum(torch.rand_like(v.to(torch.float)) * v))[1] for v in auto_infer.in_masks])
+            print(self.debug_hash_value(in_masks))
             print('replace out_masks:')
-            print([(torch.manual_seed(100), torch.sum(torch.rand_like(auto_infer.out_masks.to(torch.float)) * auto_infer.out_masks))[1]])
+            print(self.debug_hash_value(out_masks))
             print('replace weight_mask:')
-            print({k: (torch.manual_seed(100), torch.sum(torch.rand_like(v.to(torch.float)) * v))[1] for k, v in auto_infer.weight_mask.items()})
+            print(self.debug_hash_value(param_masks))
+            
             new_submodule = compressed_module
-            if reindex_dim is None:
-                setattr(super_module, g_node.name.split(
-                    '.')[-1], compressed_module)
-            elif reindex_dim is not None and reindex is not None:
-                # reindex the output of this submodule and replace the orginal module
-                new_submodule = ReindexModule(
-                    compressed_module, reindex_dim, reindex)
-                setattr(super_module, g_node.name.split(
-                    '.')[-1], new_submodule)
+            setattr(super_module, node.name.split('.')[-1], compressed_module)
             return new_submodule
         else:
             return None
@@ -881,20 +877,28 @@ class ModelSpeedup:
                 slots_in = list(i.debugName() for i in c_node.inputs())
                 slots_out = list(i.debugName() for i in c_node.outputs())
                 flatten_caller = r_jit_to_python_function(node)
+                param_masks = None
             else:
-                slots_in = node.inputs
-                slots_out = node.outputs
+                slots_in: list[str] = node.inputs
+                slots_out: list[str] = node.outputs
                 flatten_caller = get_module_by_name(self.bound_model, node.name)[1]
+                param_masks = self.masks.get(node.name, {})
+                for k, v in flatten_caller.named_parameters():
+                    if k not in param_masks:
+                        param_masks[k] = torch.ones_like(v)
+
+            if len(slots_out) == 1:
+                slots_out = slots_out[0]
+            else:
+                # assert prim::output/listunpack/tupleunpack
+                pass
 
             self.node_infos[node] = NodeInfo(
                 slots_in,
                 slots_out,
                 flatten_caller,
-                self.masks.get(node.name, None)
+                param_masks
             )
-            if len(slots_out) != 1:
-                # assert prim::output/listunpack/tupleunpack
-                pass
 
         @run_onlyif_instance(torch.Tensor)
         def value_rand_init(obj: torch.Tensor):
@@ -908,8 +912,8 @@ class ModelSpeedup:
         for c_node in self.torch_graph.trace.graph.nodes():
             c_node: torch._C.Node
 
-            slots_in = list(i.debugName() for i in c_node.inputs())
-            slots_out = list(i.debugName() for i in c_node.outputs())
+            slots_in = (i.debugName() for i in c_node.inputs())
+            slots_out = (i.debugName() for i in c_node.outputs())
             for slot_name in (*slots_in, *slots_out):
                 if slot_name not in self.slots:
                     self.slots[slot_name] = Slot()
@@ -924,26 +928,27 @@ class ModelSpeedup:
                 self.slots[c_value.debugName()].mask_1 = map_recursive(mask_ones_init, value)
                 self.slots[c_value.debugName()].status['mask_1'] += 1
 
-        for graph_input in self.torch_graph.trace.graph.inputs():
-            if graph_input.type().kind() == 'ClassType':
-                if graph_input.debugName() not in self.slots:
-                    self.slots[graph_input.debugName()] = Slot()
-                self.slots[graph_input.debugName()].value_orig = self.bound_model
-                self.slots[graph_input.debugName()].value_orig_inplace = self.bound_model
-                self.slots[graph_input.debugName()].status['value_0'] += 1
+        for input_v_node in self.torch_graph.trace.graph.inputs():
+            input_v_node: torch._C.Value
+            assert input_v_node.node().inputsSize() == 0
+            slot_name = input_v_node.debugName()
+            if input_v_node.type().kind() == 'ClassType':
+                # will not be accessed if slot_name is not in self.slots
+                if slot_name in self.slots:
+                    self.slots[slot_name].value_orig = self.bound_model
+                    self.slots[slot_name].value_orig_inplace = self.bound_model
+                    self.slots[slot_name].status['value_0'] += 1
 
-                self.slots[graph_input.debugName()].mask_1 = map_recursive(mask_ones_init, self.bound_model)
-                self.slots[graph_input.debugName()].status['mask_1'] += 1
+                    self.slots[slot_name].mask_1 = map_recursive(mask_ones_init, self.bound_model)
+                    self.slots[slot_name].status['mask_1'] += 1
+            else:
+                value = self._vnode_to_value(input_v_node)
+                self.slots[slot_name].value_orig = value
+                self.slots[slot_name].value_orig_inplace = map_recursive(value_rand_init, value)
+                self.slots[slot_name].status['value_0'] += 1
 
-        for name, nodeio in self.torch_graph.nodes_py.nodes_io.items():
-            if nodeio.input_or_output == 'input':
-                value = self._vnode_to_value(self.debugname_to_value[name])
-                self.slots[name].value_orig = value
-                self.slots[name].value_orig_inplace = map_recursive(value_rand_init, value)
-                self.slots[name].status['value_0'] += 1
-
-                self.slots[name].mask_1 = map_recursive(mask_ones_init, value)
-                self.slots[name].status['mask_1'] += 1
+                self.slots[slot_name].mask_1 = map_recursive(mask_ones_init, value)
+                self.slots[slot_name].status['mask_1'] += 1
 
     def speedup_model(self):
         """
@@ -970,12 +975,37 @@ class ModelSpeedup:
         seeds['r_inter_var'] = 1000
         seeds['r_weight'] = 1000
         for node in self.direct_order():
-            self.propagate_orig(node)
+            # torch.manual_seed(100)
+            # self.propagate_orig(node)
+            torch.manual_seed(100)
             self.r_propagate_orig(node)
-        print('inter var1:')
-        print([(k, self.debug_hash_value(v.orig_output)) for k, v in self.auto_inferences.items()])
-        print('inter var1.5:')
-        print([(k, v.orig_output.grad is None if isinstance(v.orig_output, torch.Tensor) else v.orig_output) for k, v in self.auto_inferences.items()])
+        # print('\ninter var1.1:')
+        # print([(k, self.debug_hash_value(v.orig_output)) for k, v in self.auto_inferences.items()])
+        # print('\ninter var1.2:')
+        # print([(n.unique_name, self.debug_hash_value(map_recursive(self.slot_getter_value_orig_inplace, self.node_infos[n].slots_out))) for n in self.direct_order()])
+
+        # exit()
+
+        # self.th_node = list(self.direct_order())[45]
+        # self.th_name = self.th_node.unique_name
+        # self.th_ai = self.auto_inferences[self.th_name]
+        # self.th_ni = self.node_infos[self.th_node]
+        # self.th_si = self.slots[self.th_ni.slots_in[0]]
+        # self.th_so = self.slots[self.th_ni.slots_out]
+
+        # self.p5_node = list(self.direct_order())[47]
+        # self.p5_name = self.p5_node.unique_name
+        # self.p5_ai = self.auto_inferences[self.p5_name]
+        # self.p5_ni = self.node_infos[self.p5_node]
+        # self.p5_si = self.slots[self.p5_ni.slots_in[0]]
+        # self.p5_so = self.slots[self.p5_ni.slots_out]
+
+        # self.a17_node = list(self.direct_order())[21]
+        # self.a17_name = self.a17_node.unique_name
+        # self.a17_ai = self.auto_inferences[self.a17_name]
+        # self.a17_ni = self.node_infos[self.a17_node]
+        # self.a17_si = self.slots[self.a17_ni.slots_in[0]]
+        # self.a17_so = self.slots[self.a17_ni.slots_out]
 
         _logger.info("update direct sparsity")
         torch.manual_seed(100)
@@ -984,36 +1014,109 @@ class ModelSpeedup:
         seeds['r_inter_var'] = 1000
         seeds['r_weight'] = 1000
         for node in self.direct_order():
-            self.update_direct_sparsity(node)
+            # torch.manual_seed(100)
+            # self.update_direct_sparsity(node)
+            torch.manual_seed(100)
             self.r_update_direct_sparsity(node)
-        print('inter var2:')
-        print([(k, [self.debug_hash_value(i) for i in v.in_masks]) for k, v in self.auto_inferences.items()])
-        print('inter var3:')
-        print([(k, self.debug_hash_value(v)) for k, v in self.auto_inferences.items()])
-        print('inter var4:')
-        print([(ko, [(ki, self.debug_hash_value(vi)) for ki, vi in vo.items()]) for ko, vo in self.masks.items() if not ko.startswith('.')])
-        print('inter var4.5:')
-        print([(k, v.orig_output.grad is None) for k, v in self.auto_inferences.items() if isinstance(v.orig_output, torch.Tensor)])
+            # if seeds['inter_var'] != seeds['r_inter_var']:
+            #     print('error: inter_var not_equal!')
+            # if seeds['weight'] != seeds['r_weight']:
+            #     print('error: weight not_equal!')
+        
+        for graph_output in self.torch_graph.trace.graph.outputs():
+            # self.slots[graph_output].value_clone_1 = map_recursive(self.clone_randomizer, self.slots[graph_output].value_orig)
+            self.slots[graph_output.debugName()].value_clone_1 = self.slots[graph_output.debugName()].value_orig
+            self.slots[graph_output.debugName()].status['value_1'] += 1
 
+        # print('\ninter var2.1:')
+        # print([(k, self.debug_hash_value(v.in_masks)) for k, v in self.auto_inferences.items()])
+        # print('\ninter var2.2:')
+        # # print([(n.unique_name, self.debug_hash_value(self.node_infos[n].in_mask_clone_0)) for n in self.direct_order()])
+        # print([(n.unique_name, self.debug_hash_value(map_recursive(self.slot_getter_mask_1, self.node_infos[n].slots_in))) for n in self.direct_order()])
+        # print('\ninter var2.3:')
+        # print([(k, self.debug_hash_value(v.out_masks)) for k, v in self.auto_inferences.items()])
+        # print('\ninter var2.4:')
+        # # print([(n.unique_name, self.debug_hash_value(self.node_infos[n].out_mask_clone_0)) for n in self.direct_order()])
+        # print([(n.unique_name, self.debug_hash_value(map_recursive(self.slot_getter_mask_1, self.node_infos[n].slots_out))) for n in self.direct_order()])
+        # print('\ninter var2.5:')
+        # print([(k, self.debug_hash_value(v.weight_mask)) for k, v in self.auto_inferences.items() if len(v.weight_mask) != 0])
+        # print('\ninter var2.6:')
+        # print([(n.unique_name, self.debug_hash_value(self.node_infos[n].param_masks)) for n in self.direct_order() if self.node_infos[n].param_masks])
+        # print('\ninter var2.7:')
+        # # tips: changed
+        # # no changed after clone in propagate_orig and prepare_dummy_input
+        # print([(k, self.debug_hash_value(v.orig_output)) for k, v in self.auto_inferences.items()])
+        # print('\ninter var2.8:')
+        # print([(n.unique_name, self.debug_hash_value(map_recursive(self.slot_getter_value_orig_inplace, self.node_infos[n].slots_out))) for n in self.direct_order()])
+        # print('\ninter var2.9:')
+        # print([(n.unique_name, self.debug_hash_value(map_recursive(self.slot_getter_value_1, self.node_infos[n].slots_out))) for n in self.direct_order()])
+
+        # exit()
         _logger.info("update indirect sparsity")
+
         torch.manual_seed(100)
         seeds['inter_var'] = 1000
         seeds['weight'] = 1000
         seeds['r_inter_var'] = 1000
         seeds['r_weight'] = 1000
         for node in self.indirect_order():
-            self.update_indirect_sparsity(node)
+            # torch.manual_seed(100)
+            # self.update_indirect_sparsity(node)
+            torch.manual_seed(100)
             self.r_update_indirect_sparsity(node)
-        print('inter var5:')
-        print([(k, self.debug_hash_value(v.out_masks)) for k, v in self.auto_inferences.items() if isinstance(v, torch.Tensor)])
-        # print('inter var6:')
+
+        # print('\ninter var3.1:')
+        # print([(k, self.debug_hash_value(v.in_masks)) for k, v in self.auto_inferences.items()])
+        # print('\ninter var3.2:')
+        # # print([(n.unique_name, self.debug_hash_value(self.node_infos[n].in_mask_clone_0)) for n in self.direct_order()])
+        # print([(n.unique_name, self.debug_hash_value(map_recursive(self.slot_getter_mask_1, self.node_infos[n].slots_in))) for n in self.direct_order()])
+        # print('\ninter var3.3:')
+        # print([(n.unique_name, self.debug_hash_value(map_recursive(self.slot_getter_mask_2, self.node_infos[n].slots_in))) for n in self.direct_order()])
+        # print('\ninter var3.4:')
+        # print([(n.unique_name, self.debug_hash_value(map_recursive(self.slot_getter_mask_2_or_1, self.node_infos[n].slots_in))) for n in self.direct_order()])
+        # print('\ninter var3.5:')
+        # print([(k, self.debug_hash_value(v.out_masks)) for k, v in self.auto_inferences.items()])
+        # print('\ninter var3.6:')
+        # # print([(n.unique_name, self.debug_hash_value(self.node_infos[n].out_mask_clone_1)) for n in self.direct_order()])
+        # print([(n.unique_name, self.debug_hash_value(map_recursive(self.slot_getter_mask_1, self.node_infos[n].slots_out))) for n in self.direct_order()])
+        # print('\ninter var3.7:')
+        # print([(n.unique_name, self.debug_hash_value(map_recursive(self.slot_getter_mask_2, self.node_infos[n].slots_out))) for n in self.direct_order()])
+        # print('\ninter var3.8:')
+        # print([(n.unique_name, self.debug_hash_value(map_recursive(self.slot_getter_mask_2_or_1, self.node_infos[n].slots_out))) for n in self.direct_order()])
+        # print('\ninter var3.9:')
+        # print([(k, self.debug_hash_value(v.weight_mask)) for k, v in self.auto_inferences.items() if len(v.weight_mask) != 0])
+        # print('\ninter var3.10:')
+        # print([(n.unique_name, self.debug_hash_value(self.node_infos[n].param_masks_clone_0)) for n in self.direct_order() if self.node_infos[n].param_masks])
+        
+        # def tensors_flattener(masks):
+        #     flattened = []
+        #     def helper(obj):
+        #         if isinstance(obj, torch.Tensor) and obj.numel() > 1:
+        #             flattened.append(obj)
+        #     map_recursive(helper, masks)
+        #     return flattened
+
+        # print('\ninter var3.11:')
+        # print([(k, self.debug_hash_value(v.in_masks)) for k, v in self.auto_inferences.items()])
+        # print('\ninter var3.12:')
+        # print([(n.unique_name, self.debug_hash_value(tensors_flattener(map_recursive(self.slot_getter_mask_2_or_1, self.node_infos[n].slots_in)))) for n in self.direct_order()])
+        # print('\ninter var3.13:')
+        # print([(k, self.debug_hash_value(v.out_masks)) for k, v in self.auto_inferences.items()])
+        # print('\ninter var3.14:')
+        # print([(n.unique_name, self.debug_hash_value(map_recursive(self.slot_getter_mask_2_or_1, self.node_infos[n].slots_out))) for n in self.direct_order()])
+        
+        # print('\ninter var5:')
+        # print([(k, self.debug_hash_value(v.out_masks)) for k, v in self.auto_inferences.items() if isinstance(v, torch.Tensor)])
+        # print('\ninter var6:')
         # print([(k, (torch.manual_seed(100), torch.sum(torch.rand_like(v.out_masks.to(torch.float)) * v.out_masks))[1]) for k, v in self.auto_inferences.items()])
         _logger.info('resolve the mask conflict')
 
+        # exit()
         # load the original stat dict before replace the model
         self.bound_model.load_state_dict(self.ori_state_dict)
         _logger.info("replace compressed modules...")
         # the mask conflict should be already resolved
-        self.replace_compressed_modules()
+        # self.replace_compressed_modules()
+        self.r_replace_compressed_modules()
         self.bound_model.train(self.training)
         _logger.info("speedup done")

@@ -338,85 +338,87 @@ class ModelSpeedup:
         assert len(devices) == 1
         return new_dummy_input, list(devices)[0]
 
-    def r_propagate_orig(self, node):
+    def r_propagate_orig(self):
         self.node_infos: dict[NodePyIO, NodeInfo]
         self.slots: dict[str, Slot]
 
-        module_name = node.name
-        unique_name = node.unique_name
-        node_info = self.node_infos[node]
+        _logger.info("propagate original variables")
+        for node in self.direct_order():
+            module_name = node.name
+            unique_name = node.unique_name
+            node_info = self.node_infos[node]
 
-        _logger.info('r_Propagate variables for %s', unique_name)
+            _logger.info('r_Propagate variables for %s', unique_name)
 
-        input_names = node_info.slots_in
-        input_values = map_recursive(self.slot_getter_value_1, input_names)
-        input_value_detachs = map_recursive(self.tensor_detacher, input_values)
+            input_names = node_info.slots_in
+            input_values = map_recursive(self.slot_getter_value_1, input_names)
+            input_value_detachs = map_recursive(self.tensor_detacher, input_values)
 
-        output_values = node_info.flatten_caller(*input_value_detachs)
-
-        if isinstance(node_info.slots_out, str):
-            slot_out = node_info.slots_out
-            self.slots[slot_out].value_0 = output_values
-            self.slots[slot_out].status['value_0'] += 1
-            self.slots[slot_out].value_1 = map_recursive(self.tensor_clone_detacher, output_values)
-            self.slots[slot_out].status['value_1'] += 1
-        else:
-            assert len(node_info.slots_out) == len(output_values)
-            for slot_out, output_value in zip(node_info.slots_out, output_values):
-                self.slots[slot_out].value_0 = output_value
-                self.slots[slot_out].status['value_0'] += 1
-                self.slots[slot_out].value_1 = map_recursive(self.tensor_clone_detacher, output_value)
-                self.slots[slot_out].status['value_1'] += 1
-
-    def r_update_direct_sparsity(self, node):
-        self.node_infos: dict[NodePyIO, NodeInfo]
-        self.slots: dict[str, Slot]
-
-        module_name = node.name
-        unique_name = node.unique_name
-        node_info = self.node_infos[node]
-
-        _logger.info('r_Update mask for %s', unique_name)
-
-        with torch.no_grad():
-            if isinstance(node_info.flatten_caller, nn.Module):
-                sub_module = node_info.flatten_caller
-                for _k, v in sub_module.named_parameters():
-                    randomize_tensor(v.data, start=0.1, end=8.0)
-
-                for k, v in sub_module.named_parameters():
-                    sub_module.register_parameter(
-                        k,
-                        torch.nn.Parameter(v * node_info.param_masks_0[k])
-                    )
-
-            # randomized, so it's same to use slot_getter_value_orig or slot_getter_value_orig_inplace
-            # input_values = map_recursive(self.slot_getter_value_orig, node_info.slots_in)
-            # input_values_randomized = map_recursive(self.clone_randomizer, input_values)
-            for slot_in in node_info.slots_in:
-                self.slots[slot_in].value_2 = map_recursive(self.clone_randomizer, self.slots[slot_in].value_0)
-                self.slots[slot_in].status['value_2'] += 1
-
-            input_values = map_recursive(self.slot_getter_value_2, node_info.slots_in)
-
-            input_masks = map_recursive(self.slot_getter_mask_1, node_info.slots_in)
-            input_values = map_recursive_zip(self.mask_applier, input_values, input_masks)
-
-            output_values = node_info.flatten_caller(*input_values)
-
-            output_masks = map_recursive(self.calc_one_mask, output_values)
+            output_values = node_info.flatten_caller(*input_value_detachs)
 
             if isinstance(node_info.slots_out, str):
-                output_name = node_info.slots_out
-                self.slots[output_name].mask_1 = output_masks
-                self.slots[output_name].status['mask_1'] += 1
+                slot_out = node_info.slots_out
+                self.slots[slot_out].value_0 = output_values
+                self.slots[slot_out].status['value_0'] += 1
+                self.slots[slot_out].value_1 = map_recursive(self.tensor_clone_detacher, output_values)
+                self.slots[slot_out].status['value_1'] += 1
             else:
-                assert len(node_info.slots_out) == len(output_masks)
-                for output_name, output_mask in zip(node_info.slots_out, output_masks):
-                    self.slots[output_name].mask_1 = output_mask
-                    self.slots[output_name].status['mask_1'] += 1
+                assert len(node_info.slots_out) == len(output_values)
+                for slot_out, output_value in zip(node_info.slots_out, output_values):
+                    self.slots[slot_out].value_0 = output_value
+                    self.slots[slot_out].status['value_0'] += 1
+                    self.slots[slot_out].value_1 = map_recursive(self.tensor_clone_detacher, output_value)
+                    self.slots[slot_out].status['value_1'] += 1
 
-    def r_update_indirect_sparsity(self, node):
+    def r_update_direct_sparsity(self):
+        self.node_infos: dict[NodePyIO, NodeInfo]
+        self.slots: dict[str, Slot]
+
+        _logger.info("update direct sparsity")
+
+        for slot in self.slots.values():
+            slot.value_2 = map_recursive(self.clone_randomizer, slot.value_0)
+            slot.status['value_2'] += 1
+
+        for node in self.direct_order():
+            module_name = node.name
+            unique_name = node.unique_name
+            node_info = self.node_infos[node]
+
+            _logger.info('r_Update mask for %s', unique_name)
+
+            with torch.no_grad():
+                if isinstance(node_info.flatten_caller, nn.Module):
+                    sub_module = node_info.flatten_caller
+                    for _k, v in sub_module.named_parameters():
+                        randomize_tensor(v.data, start=0.1, end=8.0)
+
+                    for k, v in sub_module.named_parameters():
+                        sub_module.register_parameter(
+                            k,
+                            torch.nn.Parameter(v * node_info.param_masks_0[k])
+                        )
+
+                input_values = map_recursive(self.slot_getter_value_2, node_info.slots_in)
+
+                input_masks = map_recursive(self.slot_getter_mask_1, node_info.slots_in)
+                input_values = map_recursive_zip(self.mask_applier, input_values, input_masks)
+
+                output_values = node_info.flatten_caller(*input_values)
+
+                output_masks = map_recursive(self.calc_one_mask, output_values)
+
+                if isinstance(node_info.slots_out, str):
+                    output_name = node_info.slots_out
+                    self.slots[output_name].mask_1 = output_masks
+                    self.slots[output_name].status['mask_1'] += 1
+                else:
+                    assert len(node_info.slots_out) == len(output_masks)
+                    for output_name, output_mask in zip(node_info.slots_out, output_masks):
+                        self.slots[output_name].mask_1 = output_mask
+                        self.slots[output_name].status['mask_1'] += 1
+
+    def r_update_indirect_sparsity(self):
         """
         This function will update the indirect sparsity. To explain what's
         indirect sparsity, for example, there is two tensors TA and TB, and
@@ -473,55 +475,57 @@ class ModelSpeedup:
         self.node_infos: dict[NodePyIO, NodeInfo]
         self.slots: dict[str, Slot]
 
-        module_name = node.name
-        unique_name = node.unique_name
-        node_info = self.node_infos[node]
+        _logger.info("update indirect sparsity")
+        for node in self.indirect_order():
+            module_name = node.name
+            unique_name = node.unique_name
+            node_info = self.node_infos[node]
 
-        _logger.info('r_Update the indirect sparsity for the %s', unique_name)
+            _logger.info('r_Update the indirect sparsity for the %s', unique_name)
 
-        if isinstance(node_info.flatten_caller, nn.Module):
-            sub_module = node_info.flatten_caller
-            for k, v in sub_module.named_parameters():
-                if v.dtype in torch_float_dtype:
-                    self.tensor_requires_grad(v)
+            if isinstance(node_info.flatten_caller, nn.Module):
+                sub_module = node_info.flatten_caller
+                for k, v in sub_module.named_parameters():
+                    if v.dtype in torch_float_dtype:
+                        self.tensor_requires_grad(v)
 
-        output_values = map_recursive(self.slot_getter_value_2, node_info.slots_out)
-        output_masks_1 = map_recursive(self.slot_getter_mask_1, node_info.slots_out)
-        output_masks_2 = map_recursive_zip(calc_indirect_mask, output_masks_1, output_values)
+            output_values = map_recursive(self.slot_getter_value_2, node_info.slots_out)
+            output_masks_1 = map_recursive(self.slot_getter_mask_1, node_info.slots_out)
+            output_masks_2 = map_recursive_zip(calc_indirect_mask, output_masks_1, output_values)
 
-        if isinstance(node_info.slots_out, str):
-            output_name = node_info.slots_out
-            self.slots[output_name].mask_2 = output_masks_2
-            self.slots[output_name].status['mask_2'] += 1
-        else:
-            assert len(node_info.slots_out) == len(output_masks_2)
-            for output_name, output_mask in zip(node_info.slots_out, output_masks_2):
-                self.slots[output_name].mask_2 = output_mask
+            if isinstance(node_info.slots_out, str):
+                output_name = node_info.slots_out
+                self.slots[output_name].mask_2 = output_masks_2
                 self.slots[output_name].status['mask_2'] += 1
+            else:
+                assert len(node_info.slots_out) == len(output_masks_2)
+                for output_name, output_mask in zip(node_info.slots_out, output_masks_2):
+                    self.slots[output_name].mask_2 = output_mask
+                    self.slots[output_name].status['mask_2'] += 1
 
-        # init apply input
-        # randomized, so it's same to use slot_getter_value_orig or slot_getter_value_orig_inplace
-        input_values = map_recursive(self.slot_getter_value_0, node_info.slots_in)
-        input_values = map_recursive(self.clone_randomizer, input_values)
+            # init apply input
+            # randomized, so it's same to use slot_getter_value_orig or slot_getter_value_orig_inplace
+            input_values = map_recursive(self.slot_getter_value_0, node_info.slots_in)
+            input_values = map_recursive(self.clone_randomizer, input_values)
 
-        input_masks = map_recursive(self.slot_getter_mask_1, node_info.slots_in)
-        input_values = map_recursive_zip(self.mask_applier, input_values, input_masks)
-        map_recursive(self.tensor_requires_grad, input_values)
+            input_masks = map_recursive(self.slot_getter_mask_1, node_info.slots_in)
+            input_values = map_recursive_zip(self.mask_applier, input_values, input_masks)
+            map_recursive(self.tensor_requires_grad, input_values)
 
-        output_values = node_info.flatten_caller(*input_values)
+            output_values = node_info.flatten_caller(*input_values)
 
-        # out_masks = map_recursive(self.slot_getter_mask_2, node_info.slots_out)
+            # out_masks = map_recursive(self.slot_getter_mask_2, node_info.slots_out)
 
-        map_recursive_zip(update_indirect_weight_mask_helper, output_values, output_masks_2)
-        if isinstance(node_info.flatten_caller, nn.Module):
-            sub_module = node_info.flatten_caller
-            for k, v in sub_module.named_parameters():
-                grad_zero = v.grad.data == 0
-                node_info.param_masks_1[k] = node_info.param_masks_0[k].clone()
-                node_info.param_masks_1[k][grad_zero] = 0
+            map_recursive_zip(update_indirect_weight_mask_helper, output_values, output_masks_2)
+            if isinstance(node_info.flatten_caller, nn.Module):
+                sub_module = node_info.flatten_caller
+                for k, v in sub_module.named_parameters():
+                    grad_zero = v.grad.data == 0
+                    node_info.param_masks_1[k] = node_info.param_masks_0[k].clone()
+                    node_info.param_masks_1[k][grad_zero] = 0
 
-        input_values_2 = map_recursive(self.slot_getter_value_2, node_info.slots_in)
-        map_recursive_zip(pass_grad, input_values_2, input_values)
+            input_values_2 = map_recursive(self.slot_getter_value_2, node_info.slots_in)
+            map_recursive_zip(pass_grad, input_values_2, input_values)
 
     def _vnode_to_value(self, c_node):
         """
@@ -550,6 +554,10 @@ class ModelSpeedup:
 
 
     def r_replace_compressed_modules(self):
+        # load the original stat dict before replace the model
+        self.bound_model.load_state_dict(self.ori_state_dict)
+        _logger.info("replace compressed modules...")
+
         with torch.no_grad():
             for node in self.direct_order():
                 self.r_replace_submodule(node)
@@ -605,6 +613,7 @@ class ModelSpeedup:
         self.node_infos: dict[NodePyIO, NodeInfo] = {}
         self.slots: dict[str, Slot] = {}
 
+        _logger.info("infer module masks...")
         for node in self.torch_graph.nodes_py.nodes_op:
             node: NodePyGroup
 
@@ -702,30 +711,19 @@ class ModelSpeedup:
         # which is more elegent
         fix_mask_conflict(self.masks, self.bound_model, self.dummy_input)
 
-        _logger.info("infer module masks...")
         self.r_initialize_propagate()
 
-        _logger.info("propagate original variables")
-        for node in self.direct_order():
-            self.r_propagate_orig(node)
+        self.r_propagate_orig()
 
-        _logger.info("update direct sparsity")
-        for node in self.direct_order():
-            self.r_update_direct_sparsity(node)
-        for graph_output in self.torch_graph.trace.graph.outputs():
-            self.slots[graph_output.debugName()].value_2 = self.slots[graph_output.debugName()].value_0
-            self.slots[graph_output.debugName()].status['value_2'] += 1
+        self.r_update_direct_sparsity()
 
-        _logger.info("update indirect sparsity")
-        for node in self.indirect_order():
-            self.r_update_indirect_sparsity(node)
+        self.r_update_indirect_sparsity()
 
         _logger.info('resolve the mask conflict')
-
-        # load the original stat dict before replace the model
-        self.bound_model.load_state_dict(self.ori_state_dict)
-        _logger.info("replace compressed modules...")
         # the mask conflict should be already resolved
+
         self.r_replace_compressed_modules()
+
         self.bound_model.train(self.training)
+
         _logger.info("speedup done")

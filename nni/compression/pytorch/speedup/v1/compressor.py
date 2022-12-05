@@ -512,6 +512,9 @@ class ModelSpeedup:
             input_values = map_recursive_zip(self.mask_applier, input_values, input_masks)
             map_recursive(self.tensor_requires_grad, input_values)
 
+            # Some operator may have the in_place operations, so we need to clone the input
+            # before passing to the self.module
+            input_values = map_recursive(self.tensor_cloner, input_values)
             output_values = node_info.flatten_caller(*input_values)
 
             # out_masks = map_recursive(self.slot_getter_mask_2, node_info.slots_out)
@@ -551,7 +554,6 @@ class ModelSpeedup:
             # currently only support the tensors and constant values
             assert value is not None, errmsg
             return value
-
 
     def r_replace_compressed_modules(self):
         # load the original stat dict before replace the model
@@ -593,7 +595,7 @@ class ModelSpeedup:
             param_masks = node_info.param_masks_1
 
             compressed_module = replace_function(leaf_module, (in_masks, out_masks, param_masks))
-            
+
             # print('\ninter var in replacement:')
             # print('replace module:', node.name)
             # print('replace in_masks:')
@@ -602,7 +604,7 @@ class ModelSpeedup:
             # print(self.debug_hash_value(out_masks))
             # print('replace weight_mask:')
             # print(self.debug_hash_value(param_masks))
-            
+
             new_submodule = compressed_module
             setattr(super_module, node.name.split('.')[-1], compressed_module)
             return new_submodule

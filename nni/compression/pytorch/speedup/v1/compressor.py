@@ -262,76 +262,15 @@ class ModelSpeedup:
             # enable the auto gradient
             obj.requires_grad_(True)
 
-    def _random_model_input(self, dummy_input, batch_dim, confidence):
-        """
-        Get the new random dummy input accordint to the original dummy_input
-        and confidence, batch_dim.
-
-        Parameters
-        ----------
-        dummy_input: Tensor or list/dict of Tensors
-            The dummy_input given by the user.
-        confidence: int
-            The new batch size of the generated dummy_input.
-        batch_dim: int
-            The index of the batch dimension.
-
-        Returns
-        ------
-        new_dummy_input: Tensor or list/dict of Tensors
-            The generated dummy_input for mask inference.
-        device: torch.device
-            The device of the generated dummy_inputs
-        """
-        input_errmsg = 'Only support the tensor, list/tuple/dict of tensors as input'
-        # Some model may use list of tensors as input, for example transformers
-        new_dummy_input, device = None, None
-        if isinstance(dummy_input, torch.Tensor):
-            input_shape = list(dummy_input.size())
-            # set the batchsize to the confidence ratio
-            input_shape[batch_dim] = confidence
-            new_dummy_input = rand_like_with_shape(input_shape, dummy_input)
-            device = dummy_input.device
-        elif isinstance(dummy_input, (tuple, list)):
-            # else if the dummy input is list/tuple
-            new_dummy_input = []
-            old_batchsize = dummy_input[0].size(0)
-            device = dummy_input[0].device
-            for _, t_input in enumerate(dummy_input):
-                assert isinstance(t_input, torch.Tensor), input_errmsg
-                assert t_input.size(0) == old_batchsize, 'The first dimension should be batchsize\
-                    and the batchsize of all inputs should be the same!'
-                input_shape = list(t_input.size())
-                input_shape[batch_dim] = confidence
-                # rand_func = torch.randint if t_input.dtype
-                new_dummy_input.append(
-                    rand_like_with_shape(input_shape, t_input))
-        elif isinstance(dummy_input, dict):
-            new_dummy_input = {}
-            tmp_key = list(dummy_input.keys())[0]
-            old_batchsize = dummy_input[tmp_key].size(0)
-            device = dummy_input[tmp_key].device
-            for in_name, t_input in dummy_input.items():
-                assert isinstance(t_input, torch.Tensor), input_errmsg
-                assert old_batchsize == t_input.size(0), 'The first dimension should be batchsize\
-                and the batchsize of all inputs should be the same!'
-                input_shape = list(t_input.size())
-                input_shape[batch_dim] = confidence
-                new_dummy_input[in_name] = rand_like_with_shape(
-                    input_shape, t_input)
-        else:
-            raise TypeError(input_errmsg)
-        return new_dummy_input, device
-
     def r_random_model_input(self, dummy_input, batch_dim, confidence):
         devices = set()
         def model_tensor_randomizer(obj):
             if isinstance(obj, torch.Tensor) and obj.dim() > batch_dim:
-                devices.add(dummy_input.device)
+                devices.add(obj.device)
                 input_shape = list(obj.size())
                 # set the batchsize to the confidence ratio
                 input_shape[batch_dim] = confidence
-                return rand_like_with_shape(input_shape, dummy_input)
+                return rand_like_with_shape(input_shape, obj)
             else:
                 return obj
         new_dummy_input = map_recursive(model_tensor_randomizer, dummy_input)

@@ -6,7 +6,6 @@ from __future__ import annotations
 import sys
 import inspect
 import operator
-import math
 import functools
 import builtins
 
@@ -71,7 +70,7 @@ class ConcreteTracer(TracerBase):
     """
 
     default_autowrap_modules = (
-        math,
+        'math',
     )
     default_autowrap_leaf_function: Dict[Any, Tuple[List[Tuple[Union[ModuleType, Type], str]], bool, Optional[Callable]]] = {
         # function
@@ -164,33 +163,12 @@ class ConcreteTracer(TracerBase):
         _orig_dict:                 ([], True),
     }
     @compatibility(is_backward_compatible=True)
-    def __init__(self, autowrap_modules: Tuple[ModuleType] = default_autowrap_modules,
-                 autowrap_leaf_function = default_autowrap_leaf_function,
-                 autowrap_leaf_class = default_autowrap_leaf_class,
-                 leaf_module = (),
-                 fake_middle_class = ()) -> None:
+    def __init__(self):
         """
         similar to _symbolic_trace.Tracer.__init__.
         remove the 'param_shapes_constant' because we can get real shape when executing.
         """
         super().__init__()
-
-        # Functions we will eagerly wrap when we see them while tracing
-        # this captures both `math.sqrt()` and `from math import sqrt` automatically
-        self._autowrap_function_ids: Set[int] = {
-            id(value) for name, value in chain(*[m.__dict__.items() for m in autowrap_modules])
-            if not name.startswith("_") and callable(value)}
-
-        # Python modules to apply autowrap to at the start, in addition to
-        # modules we see while tracing
-        self._autowrap_search: List[ModuleType] = list(autowrap_modules)
-
-        self.submodule_paths: Optional[Dict[torch.nn.Module, str]] = None
-
-        self.autowrap_leaf_function = autowrap_leaf_function
-        self.autowrap_leaf_class = autowrap_leaf_class
-        self.leaf_module = leaf_module
-        self.fake_middle_class = fake_middle_class
 
     @contextmanager
     def do_temp_disable(self, call=False, attr=False, agfunc_apply=False):
@@ -506,7 +484,12 @@ class ConcreteTracer(TracerBase):
         return root_fn, args, more_args, kwargs
 
     @compatibility(is_backward_compatible=True)
-    def trace(self, root: Union[torch.nn.Module, Callable[..., Any]],
+    def trace(self, root: Union[torch.nn.Module, Callable[..., Any]], *,
+                autowrap_modules: Tuple[str] = (),
+                autowrap_leaf_function = {},
+                autowrap_leaf_class = {},
+                leaf_module = (),
+                fake_middle_class = (),
                 concrete_args: Union[Dict[str, Any], Tuple],
                 use_operator_patch: bool = True,
                 operator_patch_backlist: List[str] = [],
@@ -531,6 +514,22 @@ class ConcreteTracer(TracerBase):
                 such as '__main__.FooModel' or '__main__.bar_func'. the namespace is
                 always needed.
         """
+
+        # Python modules to apply autowrap to at the start, in addition to
+        # modules we see while tracing
+        self._autowrap_search: List[ModuleType] = list(sys.modules[m] for m in (*autowrap_modules, *ConcreteTracer.default_autowrap_modules))
+        # Functions we will eagerly wrap when we see them while tracing
+        # this captures both `math.sqrt()` and `from math import sqrt` automatically
+        self._autowrap_function_ids: Set[int] = {
+            id(value) for name, value in chain(*[m.__dict__.items() for m in self._autowrap_search])
+            if not name.startswith("_") and callable(value)}
+
+        self.submodule_paths: Optional[Dict[torch.nn.Module, str]] = None
+
+        self.autowrap_leaf_function = {**autowrap_leaf_function, **ConcreteTracer.default_autowrap_leaf_function}
+        self.autowrap_leaf_class = {**autowrap_leaf_class, **ConcreteTracer.default_autowrap_leaf_class}
+        self.leaf_module = leaf_module
+        self.fake_middle_class = fake_middle_class
         if isinstance(root, torch.nn.Module):
             self.root = root
 
@@ -546,7 +545,17 @@ class ConcreteTracer(TracerBase):
             fn = root
 
         tracer_cls = getattr(self, '__class__', None)
-        self.graph = Graph(tracer_cls=tracer_cls)
+        self.graph = Graph(tracer_cls=tracer_cls, tracer_extras={
+            'autowrap_modules': autowrap_modules,
+            'autowrap_leaf_function': autowrap_leaf_function,
+            'autowrap_leaf_class': autowrap_leaf_class,
+            'leaf_module': leaf_module,
+            'fake_middle_class': fake_middle_class,
+            'concrete_args': concrete_args,
+            'use_operator_patch': use_operator_patch,
+            'operator_patch_backlist': operator_patch_backlist,
+            'forwrad_function_name': 'forward',
+        })
 
         # When we encounter a Tensor value that's not a parameter, we look if it
         # is some other attribute on the model. Construct a dict mapping Tensor
@@ -1218,12 +1227,12 @@ def _create_wrapped_attr_for_middle_class(tracer: ConcreteTracer, clz, the_path_
 def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
                    concrete_args: Union[Dict[str, Any], Tuple],
                    *,
-                   use_function_patch: bool = False,
-                   function_patch_backlist: List[str] = [],
+                   use_operator_patch: bool = False,
+                   operator_patch_backlist: List[str] = [],
                    forwrad_function_name: str = 'forward',
                    check_args: Optional[Dict[str, Any]] = None,
-                   autowrap_leaf_function = ConcreteTracer.default_autowrap_leaf_function,
-                   autowrap_leaf_class = ConcreteTracer.default_autowrap_leaf_class,
+                   autowrap_leaf_function = {},
+                   autowrap_leaf_class = {},
                    leaf_module = (),
                    fake_middle_class = ()) -> GraphModule:
     """
@@ -1329,7 +1338,7 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
         use_function_patch (bool): Use operator patcher recursively on function calls. Operator patcher will re-compile the function and
             translate '{} is {}' into 'operator.is_({}, {})', then we can treat 'is', 'is not', 'in' and 'not in' as function calls.
 
-        function_patch_backlist (List[str]): Blacklist of the operator patcher.
+        operator_patch_backlist (List[str]): Blacklist of the operator patcher.
 
         autowrap_leaf_function (Dict[Any, Tuple[List[Tuple[Union[ModuleType, Type], str]], bool, Optional[Callable]]]): Leaf function dict,
             such as 'add' or 'torch.xxx'. You can add your own leaf functions.
@@ -1351,14 +1360,27 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
     Returns:
         fx.GraphModule: a Module created from the recorded operations from ``root``.
     """
-    tracer = ConcreteTracer(
+    tracer = ConcreteTracer()
+    graph = tracer.trace(root,
         autowrap_leaf_function = autowrap_leaf_function,
         autowrap_leaf_class = autowrap_leaf_class,
         leaf_module = leaf_module,
         fake_middle_class = fake_middle_class,
+        concrete_args=concrete_args,
+        use_operator_patch=use_operator_patch,
+        operator_patch_backlist=operator_patch_backlist,
+        forwrad_function_name=forwrad_function_name,
     )
-    graph = tracer.trace(root, concrete_args, use_function_patch, function_patch_backlist, forwrad_function_name)
-    graph_check = tracer.trace(root, concrete_args, use_function_patch, function_patch_backlist, forwrad_function_name)
+    graph_check = tracer.trace(root,
+        autowrap_leaf_function = autowrap_leaf_function,
+        autowrap_leaf_class = autowrap_leaf_class,
+        leaf_module = leaf_module,
+        fake_middle_class = fake_middle_class,
+        concrete_args=concrete_args,
+        use_operator_patch=use_operator_patch,
+        operator_patch_backlist=operator_patch_backlist,
+        forwrad_function_name=forwrad_function_name,
+    )
     # compare to check equal
     assert len(graph.nodes) == len(graph_check.nodes)
     for node_a, node_b in zip(graph.nodes, graph_check.nodes):

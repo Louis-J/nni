@@ -37,11 +37,10 @@ model = AutoModelForSequenceClassification.from_pretrained(model_name)
 traced_model = concrete_trace(
     model,
     dummy_input,
-    use_function_patch=True,
+    use_operator_patch=True,
     autowrap_leaf_class={
         torch.finfo:                                ((), False),
         modeling_outputs.SequenceClassifierOutput:  ((), False),
-        **ConcreteTracer.default_autowrap_leaf_class,
     },
 )
 
@@ -54,3 +53,16 @@ with torch.no_grad():
 
 print("traced code:", traced_model.code)
 print("trace succeeded!")
+
+import pickle
+from pickle import _Pickler
+with open('.haha', 'wb') as f:
+    # pickle.dump(traced_model, f)
+    # torch.save(traced_model, f)
+
+    _Pickler(f).dump(traced_model)
+with open('.haha', 'rb') as f:
+    pickle.load(f)
+    # torch.load(f)
+
+print("pickle save/load succeeded!")

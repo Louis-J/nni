@@ -8,6 +8,7 @@ import inspect
 import operator
 import functools
 import builtins
+import copy
 
 from itertools import chain
 from types import BuiltinMethodType, FunctionType, MethodDescriptorType, MethodType, MethodWrapperType, ModuleType
@@ -1011,9 +1012,9 @@ class MagicMethodPatcher:
         'is_not': '{} is not {}',
         'contains': '{1} in {0}',
     }
-    format_target_ori: Any = fx_graph._format_target
     copy_attr_ori: Any = fx_graph_module._copy_attr
     find_module_of_method_ori: Any = fx_node._find_module_of_method
+    format_import_statement_ori: Any = fx_graph_module._format_import_statement
 
     @staticmethod
     def copy_attr_new(from_module: torch.nn.Module, to_module: torch.nn.Module, target: str):
@@ -1046,23 +1047,6 @@ class MagicMethodPatcher:
         else:
             setattr(to_module, field, orig)
 
-    def format_target_new(self, base: str, target: str) -> str:
-        elems = target.split('.')
-        r = base
-        field = None
-        if r == 'self':
-            field = self.root
-        for e in elems:
-            if e.isidentifier():
-                r = f'{r}.{e}'
-            elif isinstance(field, (Sequential, ModuleList, ParameterList, ModuleDict, ParameterDict)):
-                r = f'{r}.get_submodule(\'{e}\')'
-            else:
-                r = f'getattr({r}, "{e}")'
-            if field is not None:
-                field = getattr(field, e)
-        return r
-
     @staticmethod
     def find_module_of_method_new(orig_method: Callable[..., Any]) -> str:
         name = orig_method.__name__
@@ -1081,20 +1065,27 @@ class MagicMethodPatcher:
                 return guess.__name__
         raise RuntimeError(f'cannot find module for {orig_method}')
 
-    def __init__(self, root):
-        self.root = root
+    @staticmethod
+    def format_import_statement_new(name: str, obj: Any, importer) -> str:
+        if isinstance(obj, BuiltinMethodType) and getattr(obj, '__name__', None) == 'apply'\
+            and isinstance(getattr(obj, '__self__', None), Type) and issubclass(obj.__self__, torch.autograd.Function):
+            # torch.autograd.function
+            return MagicMethodPatcher.format_import_statement_ori(name, obj.__self__, importer) + f'\n{name} = {name}.apply'
+        return MagicMethodPatcher.format_import_statement_ori(name, obj, importer)
 
     def __enter__(self):
         MagicMethodPatcher.fx_graph.magic_methods = self.magic_methods_new
-        MagicMethodPatcher.fx_graph._format_target = self.format_target_new
         MagicMethodPatcher.fx_graph_module._copy_attr = self.copy_attr_new
         MagicMethodPatcher.fx_node._find_module_of_method = self.find_module_of_method_new
+        MagicMethodPatcher.fx_graph_module._format_import_statement = self.format_import_statement_new
+        MagicMethodPatcher.available = True
 
     def __exit__(self, exc_type, exc_value, tb):
         MagicMethodPatcher.fx_graph.magic_methods = MagicMethodPatcher.magic_methods_ori
-        MagicMethodPatcher.fx_graph._format_target = MagicMethodPatcher.format_target_ori
         MagicMethodPatcher.fx_graph_module._copy_attr = MagicMethodPatcher.copy_attr_ori
         MagicMethodPatcher.fx_node._find_module_of_method = MagicMethodPatcher.find_module_of_method_ori
+        MagicMethodPatcher.fx_graph_module._format_import_statement = MagicMethodPatcher.format_import_statement_ori
+        MagicMethodPatcher.available = False
         return exc_type is None
 
 def _create_wrapped_leaf_func(tracer: ConcreteTracer, func: Callable, to_func: Optional[Callable], init_tracers = ()):
@@ -1398,12 +1389,12 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
         else:
             assert node_a.op == node_b.op and target_a == target_b
 
-    with MagicMethodPatcher(tracer.root):
+    with MagicMethodPatcher():
         name = root.__class__.__name__ if isinstance(root, torch.nn.Module) else root.__name__
         traced = GraphModule(tracer.root, graph, name)
 
     # TODO: better infomation
     # # assert root(**concrete_args) == traced(**concrete_args)
     if check_args is not None:
-         assert root(**check_args) == traced(**check_args)
+        assert root(**check_args) == traced(**check_args)
     return traced
